@@ -1,6 +1,6 @@
 # DokPloy Deployment Guide
 
-This repository is configured to deploy with **DokPloy** using **Nixpacks**.
+This repository is configured to deploy with **DokPloy** using a **Dockerfile (recommended)**. The previous Nixpacks configuration is still included for compatibility.
 
 ## 🚀 Quick Deploy
 
@@ -14,7 +14,7 @@ This repository is configured to deploy with **DokPloy** using **Nixpacks**.
 #### Step 1: Create New Application
 1. In DokPloy, create a new application
 2. Connect your Git repository
-3. Select **Nixpacks** as the build provider
+3. Select **Dockerfile** as the build provider
 
 #### Step 2: Environment Variables
 Configure the following environment variables in DokPloy:
@@ -77,12 +77,27 @@ This application manages Docker containers for Supabase projects. You need to:
 
 ### 3. Build Configuration
 
-The included `nixpacks.toml` configures:
-- Node.js 20
-- OpenSSL (required for Prisma)
-- Automatic Prisma client generation
-- Database migration on startup
-- Production build optimization
+This repository includes a production-ready `Dockerfile` that:
+
+- Installs system dependencies required by Prisma (OpenSSL)
+- Installs Git and Curl (used by the app) and the Docker CLI + Compose plugin
+- Generates the Prisma client and builds the Next.js app
+- Runs `prisma db push` on container start (without destructive flags)
+- Exposes port `3000`
+
+If you prefer not to use the Dockerfile, you can still use the existing Nixpacks config.
+
+**Build Command:**
+```bash
+npm ci && npx prisma generate && npm run build
+```
+
+**Start Command:**
+```bash
+npx prisma db push && npm start
+```
+
+**Environment Variables:** Same as DokPloy configuration above
 
 ### 4. Post-Deployment
 
