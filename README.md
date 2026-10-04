@@ -132,6 +132,12 @@
 - **Docker Operations**: Automatic container management with unique naming and ports
 - **Real-time Status**: Monitor project status (active, paused, stopped)
 
+## ⚠️ Resource Usage Notice
+
+Each project runs in its own Docker container. As more projects are created, additional containers are started, which will consume CPU and memory resources accordingly.
+
+For optimal performance, ensure your server has sufficient resources to support the number of projects you plan to run.
+
 ## 🏗️ Project Structure
 
 ```
