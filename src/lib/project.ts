@@ -324,7 +324,8 @@ export async function createProject(name: string, userId: string, description?: 
       SERVICE_ROLE_KEY: generateJWT('service_role', jwtSecret, timestamp),
       SECRET_KEY_BASE: generateRandomString(64),
       VAULT_ENC_KEY: generateRandomString(32),
-      REALTIME_DB_ENC_KEY: generateRandomString(32),
+      // Realtime encrypts with AES-128, so this must be exactly 16 characters.
+      REALTIME_DB_ENC_KEY: generateRandomString(16),
       // pgcrypto requires this to be at least 32 characters.
       PG_META_CRYPTO_KEY: generateRandomString(32),
       DASHBOARD_USERNAME: 'supabase',
