@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs'
 import { prisma } from './db'
 
 export async function hashPassword(password: string): Promise<string> {
-  return bcrypt.hash(password, 12)
+  return bcrypt.hash(password as unknown as number, 12)
 }
 
 export async function verifyPassword(password: string, hashedPassword: string): Promise<boolean> {
