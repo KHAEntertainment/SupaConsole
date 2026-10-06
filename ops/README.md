@@ -10,7 +10,7 @@ Host setup and end-to-end regression for the SupaConsole test VPS.
 | `e2e.sh` | End-to-end regression against a running SupaConsole. Drives `setup → deploy → verify → delete` over the project's own HTTP API. Used as a release gate for persistent projects. |
 | `README.md` | This file. |
 
-The scripts are byte-for-byte the same as the copies on the preview host (`supaconsole-preview`, root@157.230.168.87) except that `vps-setup.sh` makes the cloned SupaConsole branch a parameter (`BRANCH=…`, default `main`) instead of hardcoding `fix/supabase-2026-compat`.
+Both scripts come from the preview host (`supaconsole-preview`, root@157.230.168.87) and have been adapted for the repo. `vps-setup.sh` makes the cloned SupaConsole branch a parameter (`BRANCH=…`, default `main`) instead of hardcoding `fix/supabase-2026-compat`; `e2e.sh` adds a non-zero-exit gate around `verify` and `delete` (see below).
 
 ## Rebuild a host
 
@@ -56,10 +56,33 @@ Expected:
   and creates a project named `compat-e2e`. Cookie jar and project metadata land in
   `/root/e2e/` (mode 700). No secret values are printed.
 - `deploy` brings the project's compose stack up. Expect 11/11 containers healthy.
-- `verify` checks container health, the gateway table from the
-  [compatibility audit](../supabase-compat-audit), and a SQL → PostgREST round trip
-  with the seeded anon key. The forged-JWT negative control must return 401/403.
-- `delete` removes the project. Expect 0 containers and 0 project directories left.
+- `verify` checks container health, the gateway table below, and a SQL → PostgREST
+  round trip with the seeded anon key. Each row is checked against its allowed
+  status codes; any row that does not match, any unhealthy container, or a missing
+  data-path row makes `verify` exit non-zero and print `RESULT: FAIL`. A clean run
+  prints `RESULT: PASS` and exits 0.
+- `delete` removes the project and counts what is left: containers, project
+  directories, Docker volumes, and Docker networks, all filtered by the project's
+  compose project name. Anything > 0 makes `delete` exit non-zero.
+
+### Expected gateway table (what `verify` checks)
+
+| Request | Allowed codes |
+| --- | --- |
+| REST root, anon key | 403 |
+| REST root, no key | 401 |
+| Auth health, anon key | 200 |
+| Auth admin/users, service key | 200 |
+| Auth admin/users, anon key (role check) | 403 |
+| Auth admin/users, forged signature | 401, 403 |
+| Storage buckets, service key | 200 |
+| Studio via gateway, dashboard creds | 200, 307 |
+| Studio via gateway, no creds | 401 |
+
+REST root with the anon key returns 403, not 200, because the upstream Supabase
+REST service is now admin-only (Supabase discussion #42949). The forged-JWT row
+accepts either 401 or 403 because upstream behaviour has been inconsistent in
+the past; both prove the signature check is rejecting the forged token.
 
 ## `verify` as a release gate
 
