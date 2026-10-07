@@ -5,13 +5,16 @@ import { hashPassword, createSession } from '@/lib/auth'
 class RegistrationClosedError extends Error {}
 class DuplicateEmailError extends Error {}
 
-// A transient write conflict (SQLite serializes writers; a racing transaction
-// may be rejected) is retried so the loser's re-read count sees the winner.
+// A transient write conflict is retried so the loser's re-read count sees the
+// winner. SQLite serializes writers (Prisma 6.15 issues BEGIN IMMEDIATE); a
+// contended BEGIN on the native connector surfaces as P1008 (socket timeout),
+// which must therefore be treated as retryable too.
 function isTransientConflict(error: unknown): boolean {
   const e = error as { code?: string; message?: string }
   return (
     e?.code === 'P2034' ||
     e?.code === 'P2028' ||
+    e?.code === 'P1008' ||
     /write conflict|deadlock|database is locked|SQLITE_BUSY|unable to start a transaction/i.test(
       e?.message ?? ''
     )
@@ -59,6 +62,10 @@ async function createUserAtomically(
       if (!isTransientConflict(error) || attempt >= 3) {
         throw error
       }
+      // Bounded backoff with jitter before the retry re-reads the count.
+      await new Promise((resolve) =>
+        setTimeout(resolve, 50 + Math.floor(Math.random() * 150))
+      )
     }
   }
 }

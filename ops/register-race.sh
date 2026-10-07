@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Regression: concurrent first-account registrations must yield exactly one 200.
 #
-# On an empty database with ALLOW_REGISTRATION unset, N concurrent registrations
-# with distinct emails must produce exactly one 200 and N-1 403s ("Registration
-# is closed") and leave exactly one user row. Run locally against a fresh SQLite
-# DB — not against a shared instance whose DB already has users.
+# On an empty database with registration not enabled (ALLOW_REGISTRATION=false),
+# N concurrent registrations with distinct emails must produce exactly one 200
+# and N-1 403s ("Registration is closed") and leave exactly one user row. Run
+# locally against a fresh SQLite DB — not against a shared instance whose DB
+# already has users.
 #
 # Usage: ops/register-race.sh   (from the repo root; npm ci + prisma generate done)
 set -uo pipefail
@@ -25,9 +26,13 @@ trap cleanup EXIT
 echo "=== fresh database $DB"
 DATABASE_URL="$DB" npx prisma db push --skip-generate >/dev/null || { echo "FAIL: prisma db push"; exit 1; }
 
-echo "=== build + start server on 127.0.0.1:$PORT (ALLOW_REGISTRATION unset)"
+echo "=== build + start server on 127.0.0.1:$PORT (ALLOW_REGISTRATION=false)"
 npm run build >/dev/null 2>&1 || { echo "FAIL: npm run build"; exit 1; }
-env -u ALLOW_REGISTRATION DATABASE_URL="$DB" npx next start -H 127.0.0.1 -p "$PORT" >"$WORK/server.log" 2>&1 &
+# ALLOW_REGISTRATION=false is passed explicitly (not just unset): next start
+# reloads .env/.env.local/.env.production, and an ALLOW_REGISTRATION=true there
+# would reopen registration and fail this test falsely. Process env beats
+# dotenv files, and the parser treats anything but 'true' as bootstrap mode.
+ALLOW_REGISTRATION=false DATABASE_URL="$DB" npx next start -H 127.0.0.1 -p "$PORT" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for i in $(seq 1 60); do
   curl -s -o /dev/null -m 2 "http://127.0.0.1:$PORT/api/auth/register" -X POST \
