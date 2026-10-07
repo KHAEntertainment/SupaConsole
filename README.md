@@ -191,6 +191,7 @@ npm run type-check      # TypeScript type checking
 | `SMTP_USER` | SMTP username | `your-email@gmail.com` |
 | `SMTP_PASS` | SMTP password/app password | `your-app-password` |
 | `SUPABASE_CORE_REPO_URL` | Supabase repo URL | `https://github.com/supabase/supabase` |
+| `ALLOW_REGISTRATION` | Enable open registration. When unset/false, only the first user can register (bootstrap mode). Set to 'true' for open registration. | `true` |
 
 ## 🐳 Docker Integration
 

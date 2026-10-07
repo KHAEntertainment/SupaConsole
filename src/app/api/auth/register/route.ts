@@ -13,6 +13,18 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // Registration lock: check if registration is allowed
+    // When ALLOW_REGISTRATION is not set, only the first user can register
+    const allowRegistration = process.env.ALLOW_REGISTRATION === 'true'
+    const userCount = await prisma.user.count()
+    
+    if (!allowRegistration && userCount > 0) {
+      return NextResponse.json(
+        { error: 'Registration is closed' },
+        { status: 403 }
+      )
+    }
+
     // Check if user already exists
     const existingUser = await prisma.user.findUnique({
       where: { email: email.toLowerCase() },
