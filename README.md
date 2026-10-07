@@ -192,7 +192,7 @@ npm run type-check      # TypeScript type checking
 | `SMTP_USER` | SMTP username | `your-email@gmail.com` |
 | `SMTP_PASS` | SMTP password/app password | `your-app-password` |
 | `SUPABASE_CORE_REPO_URL` | Supabase repo URL | `https://github.com/supabase/supabase` |
-| `SUPABASE_CORE_REF` | Supabase release to pin (tag, branch or commit SHA) | `self-hosted/v0.8.2` |
+| `SUPABASE_CORE_REF` | Supabase release to pin (tag, branch or full 40-character commit SHA; short SHAs are rejected) | `self-hosted/v0.8.2` |
 | `ALLOW_REGISTRATION` | Enable open registration. When unset/false, only the first user can register (bootstrap mode). Set to 'true' for open registration. | `true` |
 
 ## 🐳 Docker Integration
