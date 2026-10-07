@@ -80,6 +80,7 @@
    
    # Supabase Core Repository
    SUPABASE_CORE_REPO_URL="git clone --depth 1 https://github.com/supabase/supabase"
+   SUPABASE_CORE_REF="self-hosted/v0.8.2"
    
    # Application
    APP_NAME="SupaConsole Dashboard"
@@ -191,6 +192,7 @@ npm run type-check      # TypeScript type checking
 | `SMTP_USER` | SMTP username | `your-email@gmail.com` |
 | `SMTP_PASS` | SMTP password/app password | `your-app-password` |
 | `SUPABASE_CORE_REPO_URL` | Supabase repo URL | `https://github.com/supabase/supabase` |
+| `SUPABASE_CORE_REF` | Supabase release to pin (tag, branch or commit SHA) | `self-hosted/v0.8.2` |
 | `ALLOW_REGISTRATION` | Enable open registration. When unset/false, only the first user can register (bootstrap mode). Set to 'true' for open registration. | `true` |
 
 ## 🐳 Docker Integration

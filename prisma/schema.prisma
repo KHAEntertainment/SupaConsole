@@ -45,6 +45,10 @@ model Project {
   slug        String   @unique
   description String?
   status      String   @default("active") // active, paused, stopped
+  // Supabase release this project's docker files were created from. Null for
+  // projects created before the ref was pinned; shown as "unknown" in the UI.
+  supabaseRef    String?
+  supabaseCommit String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   

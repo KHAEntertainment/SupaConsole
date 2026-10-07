@@ -13,6 +13,8 @@ interface Project {
   description?: string
   status: string
   createdAt: string
+  supabaseRef?: string | null
+  supabaseCommit?: string | null
 }
 
 export default function DashboardPage() {
@@ -289,6 +291,10 @@ export default function DashboardPage() {
                       )}
                     </CardHeader>
                     <CardContent>
+                      <div className="mb-3 text-xs text-muted-foreground">
+                        Supabase: {project.supabaseRef || 'unknown'}
+                        {project.supabaseCommit ? ` · ${project.supabaseCommit.slice(0, 7)}` : ''}
+                      </div>
                       <div className="flex justify-between items-center">
                         <span className="text-sm text-muted-foreground">
                           {project.slug}
