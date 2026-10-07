@@ -196,7 +196,7 @@ async function isUsableSupabaseCore(coreDir: string): Promise<boolean> {
 
 // The configured release ref (tag, branch or commit SHA). Validated here
 // because it is passed to git as an argument.
-function normalizeCoreRef(raw: string): string {
+async function normalizeCoreRef(raw: string, coreDir: string, repoUrl: string): Promise<string> {
   const value = raw.trim().replace(/^["']|["']$/g, '')
   if (
     !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) ||
@@ -207,9 +207,13 @@ function normalizeCoreRef(raw: string): string {
   ) {
     throw new Error(`SUPABASE_CORE_REF must be a tag, branch or commit SHA, received: ${value}`)
   }
-  // A short SHA cannot be resolved reliably (only advertised ref tips could be
-  // matched), so commit refs are accepted only in full.
-  if (/^[0-9a-fA-F]{7,39}$/.test(value)) {
+  // A 7-39 character hex string is a short SHA only when it is not also a real
+  // ref name (a tag called `deadbeef` clones fine), so look for an exact
+  // refs/heads/<ref> or refs/tags/<ref> in the existing checkout and on the
+  // remote before refusing. Commit refs are accepted only in full:
+  // `git fetch origin <sha>` only takes full SHAs, and a short SHA of a
+  // historical commit cannot be expanded from advertised refs at all.
+  if (/^[0-9a-fA-F]{7,39}$/.test(value) && !(await isRefName(value, coreDir, repoUrl))) {
     throw new Error(
       `SUPABASE_CORE_REF commit SHAs must be the full 40 characters (short SHAs are not supported), received: ${value}`
     )
@@ -217,12 +221,30 @@ function normalizeCoreRef(raw: string): string {
   return value
 }
 
-function configuredCoreRef(): string {
-  return normalizeCoreRef(process.env.SUPABASE_CORE_REF || DEFAULT_CORE_REF)
+async function configuredCoreRef(coreDir: string, repoUrl: string): Promise<string> {
+  return normalizeCoreRef(process.env.SUPABASE_CORE_REF || DEFAULT_CORE_REF, coreDir, repoUrl)
 }
 
 function isCommitSha(ref: string): boolean {
   return /^[0-9a-fA-F]{40}$/.test(ref)
+}
+
+// Is this exact name a branch or a tag? Checked in the existing checkout and
+// against the remote's advertised refs (exact ref names, no DWIM). Distinguishes
+// a hex-named ref from an abbreviated SHA.
+async function isRefName(ref: string, coreDir: string, repoUrl: string): Promise<boolean> {
+  if (await git(['rev-parse', '--verify', `refs/heads/${ref}`], coreDir)) return true
+  if (await git(['rev-parse', '--verify', `refs/tags/${ref}`], coreDir)) return true
+  const listed = await git(
+    ['ls-remote', repoUrl, `refs/heads/${ref}`, `refs/tags/${ref}`],
+    process.cwd()
+  )
+  if (!listed) return false
+  for (const line of listed.split('\n')) {
+    const match = line.match(/^([0-9a-f]{40})\s+(\S+)$/)
+    if (match && (match[2] === `refs/heads/${ref}` || match[2] === `refs/tags/${ref}`)) return true
+  }
+  return false
 }
 
 // Runs git in the given directory, returning trimmed stdout, or null when the
@@ -279,7 +301,7 @@ export async function readSupabaseCoreInfo(coreDir: string): Promise<SupabaseCor
   if (!candidate) candidate = await git(['describe', '--tags', '--exact-match', 'HEAD'], coreDir)
   if (candidate && commit) {
     const resolved = await resolveLocalRefCommit(coreDir, candidate)
-    if (resolved && resolved.toLowerCase() === commit.toLowerCase()) {
+    if (resolved && resolved !== 'ambiguous' && resolved.toLowerCase() === commit.toLowerCase()) {
       return { ref: candidate, commit, source: 'git' }
     }
   }
@@ -287,21 +309,33 @@ export async function readSupabaseCoreInfo(coreDir: string): Promise<SupabaseCor
 }
 
 // Local half of ref resolution, in the same precedence `git clone --branch`
-// uses: refs/heads/<ref> first (including the remote-tracking head), then
-// refs/tags/<ref> peeled to its commit.
-async function resolveLocalRefCommit(coreDir: string, ref: string): Promise<string | null> {
-  return (
-    (await git(['rev-parse', '--verify', `refs/heads/${ref}^{commit}`], coreDir)) ??
-    (await git(['rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`], coreDir)) ??
-    (await git(['rev-parse', '--verify', `refs/tags/${ref}^{commit}`], coreDir))
-  )
+// uses: refs/heads/<ref> first, then refs/tags/<ref> peeled to its commit.
+// When there is no local head and a remote-tracking branch and a same-name tag
+// point at different commits, the name is ambiguous: the remote-tracking ref
+// may be stale (upstream may have deleted the branch since), so neither side
+// can be picked safely. Report 'ambiguous' and let callers treat the checkout
+// as unverifiable rather than silently preferring one.
+type LocalRefResolution = string | 'ambiguous' | null
+
+async function resolveLocalRefCommit(coreDir: string, ref: string): Promise<LocalRefResolution> {
+  const head = await git(['rev-parse', '--verify', `refs/heads/${ref}^{commit}`], coreDir)
+  if (head) return head
+  const tracking = await git(['rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`], coreDir)
+  const tag = await git(['rev-parse', '--verify', `refs/tags/${ref}^{commit}`], coreDir)
+  if (tracking && tag && tracking.toLowerCase() !== tag.toLowerCase()) return 'ambiguous'
+  return tracking ?? tag
 }
 
 // Resolves a ref name to a commit SHA without cloning: locally first (works
 // offline for refs already fetched), then against the remote with exact ref
 // names. Precedence is explicit and matches `git clone --branch`: heads first,
-// then peeled tags.
-async function resolveRefCommit(coreDir: string, repoUrl: string, ref: string): Promise<string | null> {
+// then peeled tags. An ambiguous local name is not resolved from the remote
+// either: the checkout is unverifiable, not wrong-but-guessable.
+async function resolveRefCommit(
+  coreDir: string,
+  repoUrl: string,
+  ref: string
+): Promise<LocalRefResolution> {
   const local = await resolveLocalRefCommit(coreDir, ref)
   if (local) return local
 
@@ -325,11 +359,6 @@ async function resolveRefCommit(coreDir: string, repoUrl: string, ref: string): 
     null
   )
 }
-
-// `git fetch origin <sha>` only accepts full SHAs, and a short SHA of a
-// historical commit cannot be expanded from advertised refs at all, so commit
-// refs are accepted only as full 40-character SHAs (enforced by
-// normalizeCoreRef).
 
 // How does the existing checkout relate to the configured ref?
 //   match     - same ref (or the configured commit SHA); Initialize is a no-op
@@ -356,6 +385,7 @@ async function checkCoreRef(
   // The configured ref may point at the checkout's commit under another name
   // (same tag fetched twice, or a commit checked out by another ref).
   const resolved = await resolveRefCommit(coreDir, repoUrl, configuredRef)
+  if (resolved === 'ambiguous') return 'unknown'
   if (resolved && info.commit) {
     return resolved.toLowerCase() === info.commit.toLowerCase() ? 'match' : 'mismatch'
   }
@@ -377,10 +407,10 @@ export async function initializeSupabaseCore(): Promise<
       await fs.mkdir(projectsDir, { recursive: true })
     }
 
-    const configuredRef = configuredCoreRef()
     const repoUrl = normalizeRepoUrl(
       process.env.SUPABASE_CORE_REPO_URL || 'https://github.com/supabase/supabase'
     )
+    const configuredRef = await configuredCoreRef(coreDir, repoUrl)
 
     if (await isUsableSupabaseCore(coreDir)) {
       const info = await readSupabaseCoreInfo(coreDir)
@@ -418,8 +448,8 @@ export async function initializeSupabaseCore(): Promise<
     if (isCommitSha(configuredRef)) {
       // A commit SHA is not a ref `git clone --branch` can take, so fetch just
       // that commit into a fresh repository instead. Commit refs are accepted
-      // only as full 40-character SHAs (normalizeCoreRef rejects short ones),
-      // which `git fetch` can resolve directly.
+      // only as full 40-character SHAs (normalizeCoreRef rejects abbreviated
+      // SHAs), which `git fetch` can resolve directly.
       await fs.mkdir(stagingDir, { recursive: true })
       await execFileAsync('git', ['init'], { cwd: stagingDir, timeout: 60000 })
       await execFileAsync('git', ['remote', 'add', 'origin', repoUrl], { cwd: stagingDir, timeout: 60000 })
@@ -456,8 +486,8 @@ export async function initializeSupabaseCore(): Promise<
     }
     if (
       isCommitSha(configuredRef) &&
-      !commit.toLowerCase().startsWith(configuredRef.toLowerCase()) &&
-      !(fetchedRev ?? '').toLowerCase().startsWith(configuredRef.toLowerCase())
+      commit.toLowerCase() !== configuredRef.toLowerCase() &&
+      (fetchedRev ?? '').toLowerCase() !== configuredRef.toLowerCase()
     ) {
       throw new Error(
         `Clone of ${configuredRef} resolved to commit ${commit}, which does not match the requested ref`
