@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { validateSession } from '@/lib/auth'
 import { deployProject } from '@/lib/project'
+import { checkProjectOwnership } from '@/lib/project-auth'
 
 interface RouteContext {
   params: Promise<{
@@ -25,6 +26,15 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
       return NextResponse.json(
         { error: 'Invalid session' },
         { status: 401 }
+      )
+    }
+
+    // Check project ownership
+    const project = await checkProjectOwnership(id, session.user.id)
+    if (!project) {
+      return NextResponse.json(
+        { error: 'Project not found' },
+        { status: 404 }
       )
     }
 

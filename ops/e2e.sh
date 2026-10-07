@@ -11,6 +11,10 @@ api() { # api METHOD PATH [JSON] [MAXTIME] -> prints "HTTP <code> <body excerpt>
   out=$(curl -s -m "$t" -b "$JAR" -c "$JAR" -X "$m" -H 'Content-Type: application/json' ${d:+-d "$d"} -w '\n%{http_code}' "$BASE$p")
   code=${out##*$'\n'}; echo "HTTP $code $(printf '%s' "${out%$'\n'*}" | head -c 300)"
 }
+code_of() { # code_of "HTTP <code> <body>" -> <code> (for check())
+  local o=${1#HTTP }
+  printf '%s' "${o%% *}"
+}
 project_id() { jq -r .project.id "$W/project.json"; }
 project_slug() { jq -r .project.slug "$W/project.json"; }
 
@@ -25,6 +29,13 @@ setup)
   step "create project"
   curl -s -m 300 -b "$JAR" -X POST -H 'Content-Type: application/json' -d '{"name":"compat-e2e"}' "$BASE/api/projects" > "$W/project.json"
   jq '{id: .project.id, slug: .project.slug, error: .error}' "$W/project.json"
+  # T1 carry-over: a create-project response without .project.id is fatal.
+  # The register call above stays non-fatal ("already exists" is an expected 400/403).
+  ID=$(project_id)
+  if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+    echo "FAIL: create project response has no .project.id"
+    exit 1
+  fi
   ;;
 deploy)
   step "deploy project $(project_id)"
@@ -99,6 +110,45 @@ verify)
 
   step "listening sockets (compose binds 0.0.0.0; DOCKER-USER must block them, so probe from outside too)"
   ss -ltnH | awk '{print $4}' | sort -u | tr '\n' ' '; echo
+
+  step "second-user authorization"
+  # A second user must not reach someone else's project: env, deploy and delete
+  # all return the same 404 as a missing project, and the project survives.
+  # Registration must be explicitly allowed for this test (server-side
+  # ALLOW_REGISTRATION=true); the register check fails if it is not.
+  JAR2="$W/cookies-user2.txt"; rm -f "$JAR2"
+  JAR_MAIN="$JAR"; JAR="$JAR2"
+  USER2_EMAIL="e2e-user2-$(date +%s)@example.com"
+  USER2_PASS="e2e-Test-pass-2"
+  out=$(api POST /api/auth/register "{\"email\":\"$USER2_EMAIL\",\"password\":\"$USER2_PASS\",\"name\":\"E2E User2\"}" 60)
+  echo "  register $USER2_EMAIL: $out"
+  check "second user register (registration allowed for test)" 200 "$(code_of "$out")"
+  out=$(api POST /api/auth/login "{\"email\":\"$USER2_EMAIL\",\"password\":\"$USER2_PASS\"}" 60)
+  echo "  login $USER2_EMAIL: $out"
+  check "second user login"                                    200 "$(code_of "$out")"
+  out=$(api GET "/api/projects/$ID/env" '' 30)
+  echo "  GET /env: HTTP $(code_of "$out")"
+  check "second user GET /env on owner's project"              404 "$(code_of "$out")"
+  out=$(api POST "/api/projects/$ID/env" '{"TEST_VAR":"hack"}' 30)
+  echo "  POST /env: $out"
+  check "second user POST /env on owner's project"             404 "$(code_of "$out")"
+  out=$(api POST "/api/projects/$ID/deploy" '' 600)
+  echo "  POST /deploy: $out"
+  check "second user POST /deploy on owner's project"          404 "$(code_of "$out")"
+  out=$(api DELETE "/api/projects/$ID" '' 600)
+  echo "  DELETE /: $out"
+  check "second user DELETE on owner's project"                404 "$(code_of "$out")"
+  JAR="$JAR_MAIN"
+  # The project must still exist: owner reads it back with its env vars intact.
+  # (An empty 200 is not existence — a deleted project still answers 200 {}.)
+  raw=$(curl -s -m 30 -b "$JAR" -w '\n%{http_code}' "$BASE/api/projects/$ID/env")
+  body=${raw%$'\n'*}; sc=${raw##*$'\n'}
+  keys=$(printf '%s' "$body" | jq -r '.envVars | length' 2>/dev/null || echo 0)
+  if [ "$sc" = 200 ] && [ "${keys:-0}" -gt 0 ] 2>/dev/null; then
+    echo "  PASS  project still exists for owner (HTTP $sc, $keys env keys)"; pass=$((pass+1))
+  else
+    echo "  FAIL  project still exists for owner (HTTP $sc, $keys env keys)"; fail=$((fail+1))
+  fi
 
   step "summary"
   echo "  passed: $pass"

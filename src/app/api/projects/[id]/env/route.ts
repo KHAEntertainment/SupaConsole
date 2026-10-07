@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { validateSession } from '@/lib/auth'
 import { updateProjectEnvVars } from '@/lib/project'
+import { checkProjectOwnership } from '@/lib/project-auth'
 import { prisma } from '@/lib/db'
 
 interface RouteContext {
@@ -26,6 +27,15 @@ export async function GET(request: NextRequest, { params }: RouteContext) {
       return NextResponse.json(
         { error: 'Invalid session' },
         { status: 401 }
+      )
+    }
+
+    // Check project ownership
+    const project = await checkProjectOwnership(id, session.user.id)
+    if (!project) {
+      return NextResponse.json(
+        { error: 'Project not found' },
+        { status: 404 }
       )
     }
 
@@ -67,6 +77,15 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
       return NextResponse.json(
         { error: 'Invalid session' },
         { status: 401 }
+      )
+    }
+
+    // Check project ownership
+    const project = await checkProjectOwnership(id, session.user.id)
+    if (!project) {
+      return NextResponse.json(
+        { error: 'Project not found' },
+        { status: 404 }
       )
     }
 
