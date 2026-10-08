@@ -94,7 +94,7 @@ npm ci && npx prisma generate && npm run build
 
 **Start Command:**
 ```bash
-node scripts/db-migrate.mjs && npm start
+NODE_ENV=production node scripts/db-migrate.mjs && npm start
 ```
 
 **Environment Variables:** Same as DokPloy configuration above
@@ -155,7 +155,7 @@ npm ci && npx prisma generate && npm run build
 
 **Start Command:**
 ```bash
-node scripts/db-migrate.mjs && npm start
+NODE_ENV=production node scripts/db-migrate.mjs && npm start
 ```
 
 **Environment Variables:** Same as DokPloy configuration above

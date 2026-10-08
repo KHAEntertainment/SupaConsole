@@ -6,6 +6,7 @@ import {
   decideAction,
   isAdditiveStatement,
   splitSqlStatements,
+  verifyConvergedAfterApply,
 } from '../scripts/db-migrate.mjs'
 
 describe('decideAction', () => {
@@ -75,7 +76,9 @@ describe('classifyDiffScript', () => {
       '-- CreateTable',
       'CREATE TABLE "sessions" (',
       '    "id" TEXT NOT NULL PRIMARY KEY,',
-      '    "token" TEXT NOT NULL',
+      '    "token" TEXT NOT NULL,',
+      '    "userId" TEXT NOT NULL,',
+      '    CONSTRAINT "sessions_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE CASCADE',
       ');',
       '',
       '-- CreateIndex',
@@ -86,27 +89,72 @@ describe('classifyDiffScript', () => {
     expect(verdict.statements).toHaveLength(4)
   })
 
-  it('accepts an additive statement whose DEFAULT literal contains a semicolon', () => {
-    const sql = `ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT 'a;b';`
-    const verdict = classifyDiffScript(sql)
-    expect(verdict.kind).toBe('additive')
-    expect(verdict.statements).toHaveLength(1)
+  it('accepts ALTER ADD COLUMN with canonical constraints', () => {
+    expect(
+      isAdditiveStatement(`ALTER TABLE "projects" ADD COLUMN "status" TEXT NOT NULL DEFAULT 'active'`)
+    ).toBe(true)
+    expect(
+      isAdditiveStatement(
+        'ALTER TABLE "projects" ADD COLUMN "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP'
+      )
+    ).toBe(true)
   })
 
-  it('accepts additive statements with comments around the keywords', () => {
-    const verdict = classifyDiffScript(
-      `/* c1 */ CREATE /* c2 */ TABLE "x" ("v" TEXT DEFAULT 'x;y'); -- done\n`
-    )
-    expect(verdict.kind).toBe('additive')
+  it('rejects literals containing ";" (blind split, then odd-quote rejection)', () => {
+    // Deliberate contract change from the tokenizer era: Prisma diffs never
+    // put `;` inside literals, and such input must be refused, not parsed.
+    const verdict = classifyDiffScript(`ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT 'a;b';`)
+    expect(verdict.kind).toBe('unsafe')
   })
 
   it('refuses the crafted comment-marker-in-literal statement pair', () => {
-    // Naive comment stripping turns "DEFAULT '--'" into an open string and
-    // hides the DROP; the tokenizer must see both statements and refuse.
+    // Stripping "--" line comments mangles the literal into an unterminated
+    // quote; the odd-quote check refuses it. Reconstruction would never let
+    // the DROP reach SQLite either way.
     const sql = `CREATE TABLE x(v TEXT DEFAULT '--'); DROP TABLE users;`
     const verdict = classifyDiffScript(sql)
     expect(verdict.kind).toBe('unsafe')
-    expect(verdict.statements).toHaveLength(2)
+    expect(verdict.statements).toHaveLength(1)
+  })
+
+  it('refuses backtick identifiers (Codex payload)', () => {
+    const verdict = classifyDiffScript('CREATE TABLE `x--` (v TEXT); DROP TABLE users;')
+    expect(verdict.kind).toBe('unsafe')
+  })
+
+  it('refuses bracket identifiers (Codex payload)', () => {
+    const verdict = classifyDiffScript('CREATE TABLE [x--] (v TEXT); DROP TABLE users;')
+    expect(verdict.kind).toBe('unsafe')
+  })
+
+  it('refuses DROP COLUMN and RENAME disguised with an "ADD COLUMN" identifier', () => {
+    expect(
+      classifyDiffScript('ALTER TABLE projects DROP COLUMN "ADD COLUMN";').kind
+    ).toBe('unsafe')
+    expect(
+      classifyDiffScript('ALTER TABLE projects RENAME TO "ADD COLUMN";').kind
+    ).toBe('unsafe')
+    expect(
+      classifyDiffScript('ALTER TABLE "projects" DROP COLUMN "ADD COLUMN";').kind
+    ).toBe('unsafe')
+    expect(
+      classifyDiffScript('ALTER TABLE "projects" RENAME TO "ADD COLUMN";').kind
+    ).toBe('unsafe')
+  })
+
+  it('refuses EOF inside a quote', () => {
+    expect(
+      classifyDiffScript(`ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT 'unfinished`).kind
+    ).toBe('unsafe')
+    expect(
+      classifyDiffScript(`ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT "unfinished`).kind
+    ).toBe('unsafe')
+  })
+
+  it('refuses an unclosed block comment', () => {
+    expect(
+      classifyDiffScript('ALTER TABLE "t" ADD COLUMN "c" TEXT; /*\nDROP TABLE users;').kind
+    ).toBe('unsafe')
   })
 
   it('refuses CREATE TABLE ... AS SELECT', () => {
@@ -157,24 +205,50 @@ describe('classifyDiffScript', () => {
     expect(
       isAdditiveStatement('CREATE UNIQUE INDEX "projects_slug_key" ON "projects"("slug")')
     ).toBe(true)
+    expect(
+      isAdditiveStatement('CREATE UNIQUE INDEX "t_a_b" ON "t"("a" ASC, "b" DESC)')
+    ).toBe(true)
   })
 
-  it('splits only on top-level semicolons, respecting quotes', () => {
-    const statements = splitSqlStatements(
-      `ALTER TABLE "a" ADD COLUMN "b" TEXT DEFAULT 'x;y';\n` +
-        `CREATE TABLE "c;odd" ("d" TEXT DEFAULT '--');\n`
-    )
-    expect(statements).toHaveLength(2)
-    expect(statements[0]).toMatch(/^ALTER TABLE/)
-    expect(statements[1]).toContain(`DEFAULT '--'`)
+  it('refuses non-canonical statements keyword-denied after masking literals', () => {
+    // "DROP" inside a literal is data and must not trip the denylist…
+    expect(
+      isAdditiveStatement(`ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT 'DROP TABLE x'`)
+    ).toBe(true)
+    // …but real keyword statements are denied even if shaped oddly.
+    expect(isAdditiveStatement('ALTER TABLE "t" ADD COLUMN "c" TEXT TRIGGER')).toBe(false)
+    expect(isAdditiveStatement('CREATE TABLE "x" ("v" TEXT ATTACH)')).toBe(false)
   })
+})
 
-  it('splits statements and drops comments', () => {
+describe('splitSqlStatements', () => {
+  it('splits on every semicolon after stripping line comments', () => {
     const statements = splitSqlStatements(
       '-- AlterTable\nALTER TABLE "a" ADD COLUMN "b" TEXT;\n\n-- CreateTable\nCREATE TABLE "c" ("id" TEXT);\n'
     )
     expect(statements).toHaveLength(2)
     expect(statements[0]).toMatch(/^ALTER TABLE/)
     expect(statements[1]).toMatch(/^CREATE TABLE/)
+  })
+
+  it('does not treat quotes as semicolon context (such diffs are refused later)', () => {
+    const statements = splitSqlStatements(
+      `ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT 'a;b';`
+    )
+    expect(statements).toHaveLength(2)
+  })
+})
+
+describe('verifyConvergedAfterApply', () => {
+  it('accepts an empty post-apply diff', () => {
+    expect(() => verifyConvergedAfterApply('-- This is an empty migration\n')).not.toThrow()
+    expect(() => verifyConvergedAfterApply('')).not.toThrow()
+  })
+
+  it('rejects a post-apply diff that is not empty', () => {
+    expect(() =>
+      verifyConvergedAfterApply('ALTER TABLE "x" ADD COLUMN "y" TEXT;')
+    ).toThrow(/did not stick/)
+    expect(() => verifyConvergedAfterApply('DROP TABLE "x";')).toThrow(/did not stick/)
   })
 })

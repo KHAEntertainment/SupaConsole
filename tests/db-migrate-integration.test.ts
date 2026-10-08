@@ -15,6 +15,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PrismaClient } from '@prisma/client'
 import { afterAll, describe, expect, it } from 'vitest'
+import { verifyConvergedAfterApply } from '../scripts/db-migrate.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const initSql = readFileSync(
@@ -61,22 +62,34 @@ interface RunOpts {
   script?: string
   /** Remove these env vars from the child before running (e.g. ['DATABASE_URL']). */
   unsetEnv?: string[]
+  /** NODE_ENV for the child; 'unset' (default) removes it entirely. */
+  nodeEnv?: 'development' | 'production' | 'unset'
 }
 
 function runMigrate(url: string | null, opts: RunOpts = {}) {
-  // NODE_ENV=development so @next/env loads .env.local (it skips it under
-  // NODE_ENV=test) and uses dev precedence, like `next dev`.
-  const env: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: 'development' }
+  const env: Record<string, string | undefined> = { ...process.env }
   for (const key of opts.unsetEnv ?? []) delete env[key]
+  delete env.NODE_ENV
+  const nodeEnv = opts.nodeEnv ?? 'unset'
+  if (nodeEnv !== 'unset') env.NODE_ENV = nodeEnv
   if (url === null) delete env.DATABASE_URL
   else env.DATABASE_URL = url
   const script = opts.script ?? path.join(repoRoot, 'scripts', 'db-migrate.mjs')
   return spawnSync(process.execPath, [script], {
     cwd: opts.cwd ?? repoRoot,
-    env,
+    env: env as NodeJS.ProcessEnv,
     encoding: 'utf8',
     timeout: 120000,
   })
+}
+
+function runMigrateDiff(fromUrl: string, toUrl: string) {
+  const { command, prefix } = prismaCliCmd()
+  return spawnSync(
+    command,
+    [...prefix, 'migrate', 'diff', '--from-url', fromUrl, '--to-url', toUrl, '--script'],
+    { cwd: repoRoot, env: { ...process.env }, encoding: 'utf8', timeout: 60000 }
+  )
 }
 
 function migrateStatus(url: string) {
@@ -433,5 +446,52 @@ INSERT INTO "users" ("id", "email", "password", "updatedAt")
         { id: 'p2', slug: 'dup' },
       ])
     })
+  }, 120000)
+
+  it('post-check catches convergence that did not stick (applied then reverted)', async () => {
+    const dir = makeTmpDir()
+    const url = dbUrl(path.join(dir, 'reverted.db'))
+    const target = dbUrl(path.join(dir, 'target.db'))
+    execSql(url, PRE_T3_SQL)
+    execSql(target, initSql)
+
+    // Apply the additive batch as the script would…
+    execSql(
+      url,
+      `ALTER TABLE "projects" ADD COLUMN "supabaseCommit" TEXT;
+ALTER TABLE "projects" ADD COLUMN "supabaseRef" TEXT;`
+    )
+    // …then revert one applied statement (the silently-uncommitted class).
+    execSql(url, 'ALTER TABLE "projects" DROP COLUMN "supabaseRef";')
+
+    const after = runMigrateDiff(url, target)
+    expect(after.status, after.stdout + after.stderr).toBe(0)
+    expect(after.stdout).toContain('supabaseRef')
+    expect(() => verifyConvergedAfterApply(after.stdout)).toThrow(/did not stick/)
+  }, 120000)
+
+  it('uses .env.production when NODE_ENV is unset (matches next start)', async () => {
+    const sandbox = makeSandbox()
+    writeFileSync(path.join(sandbox, '.env'), 'DATABASE_URL=file:./from-base.db\n')
+    writeFileSync(path.join(sandbox, '.env.development'), 'DATABASE_URL=file:./from-dev.db\n')
+    writeFileSync(path.join(sandbox, '.env.production'), 'DATABASE_URL=file:./from-prod.db\n')
+    const baseDb = path.join(sandbox, 'prisma', 'from-base.db')
+    const devDb = path.join(sandbox, 'prisma', 'from-dev.db')
+    const prodDb = path.join(sandbox, 'prisma', 'from-prod.db')
+    execSql(dbUrl(baseDb), PRE_T3_SQL)
+    execSql(dbUrl(devDb), PRE_T3_SQL)
+    execSql(dbUrl(prodDb), PRE_T3_SQL)
+
+    const result = runMigrate(null, {
+      cwd: sandbox,
+      script: path.join(sandbox, 'scripts', 'db-migrate.mjs'),
+      unsetEnv: ['DATABASE_URL'],
+      nodeEnv: 'unset',
+    })
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+
+    expect(await tableExists(dbUrl(prodDb), '_prisma_migrations')).toBe(true)
+    expect(await tableExists(dbUrl(devDb), '_prisma_migrations')).toBe(false)
+    expect(await tableExists(dbUrl(baseDb), '_prisma_migrations')).toBe(false)
   }, 120000)
 })

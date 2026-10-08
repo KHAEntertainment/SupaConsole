@@ -15,6 +15,11 @@
 // resolve against prisma/ , as Prisma Client and schema-based CLI commands do)
 // and that absolute URL is used for every diff/execute/resolve/deploy.
 //
+// The convergence SQL is never executed raw: only statements matching the
+// exact shapes Prisma's SQLite renderer emits are accepted, and the batch is
+// rebuilt from those statements (comments can never reach SQLite), wrapped in
+// one transaction, and verified against a fresh diff afterwards.
+//
 // Used by the Dockerfile CMD, ops/vps-setup.sh and `npm run db:migrate`.
 import { execSync } from 'node:child_process'
 import {
@@ -59,48 +64,84 @@ export function canonicalizeDatabaseUrl(rawUrl, schemaDir) {
   return `file:${path.resolve(schemaDir, filePath)}${suffix}`
 }
 
-// Blanks the contents of single-quoted SQL string literals (keeping the
-// quotes and the exact length) so classification regexes cannot be fooled by
-// `;`, `--` or keywords inside literals. Double-quoted identifiers pass
-// through, because checks like the `new_` table artifact need them.
-function maskStringLiterals(sql) {
+// ---------------------------------------------------------------------------
+// Convergence SQL validation.
+//
+// Deliberately NOT a general SQL tokenizer: the only diffs that may be applied
+// are the ones Prisma's SQLite renderer produces, so validation is "match the
+// canonical shapes exactly, refuse everything else".
+// ---------------------------------------------------------------------------
+
+const ID = '"[A-Za-z0-9_]+"'
+const TYPE =
+  '(?:TEXT|DATETIME|INTEGER|REAL|BOOLEAN|BLOB|DECIMAL(?:\\([0-9]+(?:,\\s*[0-9]+)?\\))?)'
+const LITERAL =
+  "(?:'(?:[^']|'')*'|NULL|CURRENT_TIMESTAMP|true|false|-?[0-9]+(?:\\.[0-9]+)?)"
+const ALTER_ADD_COLUMN_RE = new RegExp(
+  `^ALTER TABLE ${ID} ADD COLUMN ${ID} ${TYPE}(?: NOT NULL)?(?: DEFAULT ${LITERAL})?$`
+)
+const CREATE_TABLE_RE = new RegExp(`^CREATE TABLE ${ID} \\([\\s\\S]+\\)$`)
+const CREATE_INDEX_RE = new RegExp(
+  `^CREATE (?:UNIQUE )?INDEX ${ID} ON ${ID}\\(${ID}(?: (?:ASC|DESC))?(?:, ${ID}(?: (?:ASC|DESC))?)*\\)$`
+)
+const DENIED_KEYWORD_RE =
+  /\b(?:DROP|RENAME|DELETE|UPDATE|INSERT|PRAGMA|ATTACH|TRIGGER|VIEW)\b/i
+
+function hasBalancedQuotes(text) {
+  const singles = (text.match(/'/g) ?? []).length
+  const doubles = (text.match(/"/g) ?? []).length
+  return singles % 2 === 0 && doubles % 2 === 0
+}
+
+// Whole-diff character scan: no backticks, no bracket identifiers, no block
+// comments, nothing outside printable ASCII (plus tab/newline/CR).
+function scanDiffInput(sql) {
+  if (sql.includes('`')) return { ok: false, reason: 'diff contains a backtick' }
+  if (sql.includes('[')) return { ok: false, reason: 'diff contains "["' }
+  if (sql.includes('/*')) return { ok: false, reason: 'diff contains "/*"' }
+  if (/[^\t\n\r\x20-\x7E]/.test(sql)) {
+    return { ok: false, reason: 'diff contains control or non-ASCII characters' }
+  }
+  return { ok: true }
+}
+
+function stripLineComments(sql) {
+  return sql.replace(/--[^\n]*/g, '')
+}
+
+// Strips `--` line comments, then splits on every `;`. Quotes are not
+// semicolon context: a literal containing `;` splits the statement, the halves
+// then fail the balanced-quote check and the whole diff is refused (Prisma
+// diffs never put `;` inside literals).
+export function splitSqlStatements(sql) {
+  return stripLineComments(sql)
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0)
+}
+
+// Blanks the contents of '…' / "…" literals (quotes and length kept) so
+// keyword scans cannot be fooled by literal text. Handles '' and "" escapes.
+function maskSqlTokens(sql) {
   let out = ''
   let i = 0
   while (i < sql.length) {
     const c = sql[i]
-    if (c === "'") {
-      out += "'"
+    if (c === "'" || c === '"') {
+      out += c
       i++
       while (i < sql.length) {
-        if (sql[i] === "'") {
-          if (sql[i + 1] === "'") {
+        if (sql[i] === c) {
+          if (sql[i + 1] === c) {
             out += '  '
             i += 2
             continue
           }
-          out += "'"
+          out += c
           i++
           break
         }
         out += ' '
-        i++
-      }
-      continue
-    }
-    if (c === '"') {
-      out += c
-      i++
-      while (i < sql.length) {
-        out += sql[i]
-        if (sql[i] === '"') {
-          if (sql[i + 1] === '"') {
-            out += '"'
-            i += 2
-            continue
-          }
-          i++
-          break
-        }
         i++
       }
       continue
@@ -111,84 +152,42 @@ function maskStringLiterals(sql) {
   return out
 }
 
-// Splits a Prisma `migrate diff --script` body into statements. Tokenizing is
-// quote- and comment-aware: `;` inside '…' / "…" literals does not split, and
-// `--` / `*//*` comments are dropped (but comment markers inside literals are
-// literal text). Splits only on top-level `;`.
-export function splitSqlStatements(sql) {
-  const statements = []
-  let current = ''
-  let i = 0
-  while (i < sql.length) {
-    const c = sql[i]
-    const next = sql[i + 1]
-    if (c === '-' && next === '-') {
-      while (i < sql.length && sql[i] !== '\n') i++
-      continue
-    }
-    if (c === '/' && next === '*') {
-      i += 2
-      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i++
-      i += 2
-      continue
-    }
-    if (c === "'" || c === '"') {
-      const quote = c
-      current += c
-      i++
-      while (i < sql.length) {
-        if (sql[i] === quote) {
-          if (sql[i + 1] === quote) {
-            current += quote + quote
-            i += 2
-            continue
-          }
-          current += quote
-          i++
-          break
-        }
-        current += sql[i]
-        i++
-      }
-      continue
-    }
-    if (c === ';') {
-      const trimmed = current.trim()
-      if (trimmed) statements.push(trimmed)
-      current = ''
-      i++
-      continue
-    }
-    current += c
-    i++
-  }
-  const trimmed = current.trim()
-  if (trimmed) statements.push(trimmed)
-  return statements
+// Second validation layer, applied after masking literals. `ON DELETE` /
+// `ON UPDATE` referential actions are masked too: they are canonical Prisma
+// foreign-key syntax ("ON DELETE CASCADE ON UPDATE CASCADE"), not statements.
+function hasDeniedKeyword(statement) {
+  const masked = maskSqlTokens(statement).replace(
+    /\bON\s+(?:DELETE|UPDATE)\b/gi,
+    '   '
+  )
+  return DENIED_KEYWORD_RE.test(masked)
 }
 
-// Additive-only whitelist: the change may not lose or rewrite anything that
-// already exists. `CREATE TABLE "new_...` is the RedefineTables artifact of a
-// table rebuild and `CREATE TABLE ... AS SELECT` copies data; both are refused
-// even though they start with CREATE TABLE.
+// True only for statements exactly shaped like Prisma's canonical SQLite
+// output: ALTER TABLE … ADD COLUMN …, CREATE TABLE … ( … ), and
+// CREATE [UNIQUE] INDEX … ON …("col"[ ASC|DESC], …).
 export function isAdditiveStatement(statement) {
   const sql = statement.trim()
-  const masked = maskStringLiterals(sql)
-  if (/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?new_/i.test(sql)) return false
-  if (/^CREATE\s+TABLE\b/i.test(masked)) {
-    return !/\bAS\s+SELECT\b/i.test(masked)
+  if (!hasBalancedQuotes(sql)) return false
+  if (hasDeniedKeyword(sql)) return false
+  if (ALTER_ADD_COLUMN_RE.test(sql)) return true
+  const tableMatch = /^CREATE TABLE "([A-Za-z0-9_]+)" \([\s\S]+\)$/.exec(sql)
+  if (tableMatch) {
+    if (/^new_/i.test(tableMatch[1])) return false
+    if (/\bAS\s+SELECT\b/i.test(maskSqlTokens(sql))) return false
+    return CREATE_TABLE_RE.test(sql)
   }
-  if (/^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(masked)) return true
-  if (/^ALTER\s+TABLE\b/i.test(masked) && /\bADD\s+COLUMN\b/i.test(masked)) {
-    return true
-  }
-  return false
+  return CREATE_INDEX_RE.test(sql)
 }
 
 // Classifies a schema-diff script as 'empty' (schemas match), 'additive'
-// (safe to apply: ADD COLUMN / CREATE TABLE / CREATE INDEX only) or 'unsafe'
-// (DROP, RedefineTables, CTAS, rewrites, unknown statements).
+// (safe to apply) or 'unsafe'.
 export function classifyDiffScript(sql) {
+  const scan = scanDiffInput(sql)
+  if (!scan.ok) return { kind: 'unsafe', statements: [], rejected: scan.reason }
+  if (!hasBalancedQuotes(sql)) {
+    return { kind: 'unsafe', statements: [], rejected: 'unbalanced quote' }
+  }
   const statements = splitSqlStatements(sql)
   if (statements.length === 0) return { kind: 'empty', statements }
   for (const statement of statements) {
@@ -197,6 +196,18 @@ export function classifyDiffScript(sql) {
     }
   }
   return { kind: 'additive', statements }
+}
+
+// Post-apply gate: the convergence batch must have brought the database all
+// the way to 0_init. A non-empty diff here means the executed batch did not
+// stick (e.g. silently rolled back) and baselining must not proceed.
+export function verifyConvergedAfterApply(afterDiffSql) {
+  const verdict = classifyDiffScript(afterDiffSql)
+  if (verdict.kind !== 'empty') {
+    throw new Error(
+      'convergence did not stick: schema still differs from 0_init after applying the batch'
+    )
+  }
 }
 
 async function inspectTables() {
@@ -245,12 +256,12 @@ function prismaCliOutput(args, cwd) {
 }
 
 // Brings a legacy db-push database up to the 0_init schema before it is
-// baselined, using only additive statements. The difference is computed
-// against a scratch DB that holds exactly 0_init (NOT schema.prisma, which
-// will be ahead of 0_init once later migrations exist). Anything non-additive
-// aborts before a single statement is applied to the legacy DB, and the
-// additive batch runs inside one SQLite transaction so a late failure (e.g. a
-// unique index rejected by duplicate rows) rolls everything back.
+// baselined. The difference is computed against a scratch DB that holds
+// exactly 0_init (NOT schema.prisma, which will be ahead of 0_init once later
+// migrations exist). Only canonical additive statements are accepted, and the
+// batch is rebuilt from those statements and executed inside one SQLite
+// transaction so a late failure rolls everything back. Afterwards the diff is
+// re-run and must be empty before 0_init is marked applied.
 function convergeLegacyToBaseline(url, repoRoot) {
   const migrationSql = path.join(
     repoRoot,
@@ -292,11 +303,33 @@ function convergeLegacyToBaseline(url, repoRoot) {
       `[db-migrate] legacy schema differs from ${BASELINE_MIGRATION}; ` +
         `applying ${verdict.statements.length} additive statement(s):`
     )
-    console.log(diff.trim())
+    console.log(
+      verdict.statements.map((statement) => `${statement};`).join('\n')
+    )
+    // Execute the RECONSTRUCTED batch, never the raw diff: comments and any
+    // smuggled text can never reach SQLite.
+    const batch = `BEGIN;\n${verdict.statements
+      .map((statement) => `${statement};`)
+      .join('\n')}\nCOMMIT;\n`
     const convergeSql = path.join(tmpDir, 'converge.sql')
-    writeFileSync(convergeSql, `BEGIN;\n${diff}\nCOMMIT;\n`)
+    writeFileSync(convergeSql, batch)
     prismaCli(`db execute --file ${q(convergeSql)} --url ${q(url)}`, repoRoot)
     console.log('[db-migrate] additive schema updates applied')
+
+    const after = prismaCliOutput(
+      `migrate diff --from-url ${q(url)} --to-url ${q(targetUrl)} --script`,
+      repoRoot
+    )
+    try {
+      verifyConvergedAfterApply(after)
+    } catch (error) {
+      console.error(`[db-migrate] ${error.message}`)
+      console.error(
+        `[db-migrate] not marking ${BASELINE_MIGRATION} as applied. ` +
+          'Reconcile the database manually, then re-run.'
+      )
+      process.exit(1)
+    }
   } finally {
     rmSync(tmpDir, { recursive: true, force: true })
   }
@@ -306,9 +339,10 @@ export async function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
   const schemaDir = path.join(repoRoot, 'prisma')
 
-  // Same file set and precedence as the Next.js app; exported process vars
-  // stay authoritative.
-  loadEnvConfig(repoRoot, process.env.NODE_ENV !== 'production')
+  // Same file precedence as the app: production semantics unless NODE_ENV is
+  // explicitly development (matching `next start`, which forces production).
+  // Exported process vars stay authoritative.
+  loadEnvConfig(repoRoot, process.env.NODE_ENV === 'development')
 
   if (!process.env.DATABASE_URL) {
     console.error(
