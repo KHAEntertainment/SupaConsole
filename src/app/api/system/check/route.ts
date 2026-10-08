@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { validateSession } from '@/lib/auth'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
 
 // Improved internet connectivity check using multiple methods
 async function checkInternetConnectivity(): Promise<boolean> {
@@ -17,7 +17,7 @@ async function checkInternetConnectivity(): Promise<boolean> {
   for (const endpoint of httpEndpoints) {
     try {
       // Use curl for HTTP connectivity test with short timeout
-      await execAsync(`curl -s --max-time 10 --head ${endpoint}`, { timeout: 15000 })
+      await execFileAsync('curl', ['-s', '--max-time', '10', '--head', endpoint], { timeout: 15000 })
       return true // If any endpoint succeeds, we have internet
     } catch {
       // Try next endpoint
@@ -27,7 +27,7 @@ async function checkInternetConnectivity(): Promise<boolean> {
   
   // Method 2: DNS resolution test
   try {
-    await execAsync('nslookup google.com', { timeout: 10000 })
+    await execFileAsync('nslookup', ['google.com'], { timeout: 10000 })
     return true
   } catch {
     // DNS resolution failed
@@ -35,10 +35,10 @@ async function checkInternetConnectivity(): Promise<boolean> {
   
   // Method 3: Ping test (as fallback)
   try {
-    const pingCommand = process.platform === 'win32' 
-      ? 'ping -n 1 8.8.8.8' 
-      : 'ping -c 1 8.8.8.8'
-    await execAsync(pingCommand, { timeout: 10000 })
+    const pingArgs = process.platform === 'win32' 
+      ? ['-n', '1', '8.8.8.8'] 
+      : ['-c', '1', '8.8.8.8']
+    await execFileAsync('ping', pingArgs, { timeout: 10000 })
     return true
   } catch {
     // Ping failed
@@ -46,7 +46,7 @@ async function checkInternetConnectivity(): Promise<boolean> {
   
   // Method 4: Docker registry connectivity (original method as last resort)
   try {
-    await execAsync('docker pull alpine:latest', { 
+    await execFileAsync('docker', ['pull', 'alpine:latest'], { 
       timeout: 30000,
       maxBuffer: 1024 * 1024 * 5 // 5MB buffer for Docker pull
     })
@@ -86,18 +86,18 @@ export async function GET(request: NextRequest) {
     }
     
     try {
-      await execAsync('docker --version')
+      await execFileAsync('docker', ['--version'])
       checks.docker = true
       
       // Check if Docker daemon is running
-      await execAsync('docker info')
+      await execFileAsync('docker', ['info'])
       checks.dockerRunning = true
     } catch {
       // Docker not available or not running
     }
     
     try {
-      await execAsync('docker compose version')
+      await execFileAsync('docker', ['compose', 'version'])
       checks.dockerCompose = true
     } catch {
       // Docker Compose not available

@@ -1,11 +1,11 @@
 import { promises as fs } from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
-import { exec, execFile } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { prisma } from './db'
+import * as engine from './engine'
 
-const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
 
 // The Supabase release projects are created from. Overridable with
@@ -75,103 +75,6 @@ export function parseEnvExample(content: string): Map<string, string> {
     vars.set(key, value)
   }
   return vars
-}
-
-// Extracts every container_name declared in the compose file so the
-// per-project renaming stays correct as services are added or removed
-// upstream (e.g. supabase-kong -> supabase-envoy).
-function extractContainerNames(composeContent: string): string[] {
-  const names: string[] = []
-  const seen = new Set<string>()
-  for (const match of composeContent.matchAll(/^\s*container_name:\s*(\S+)\s*$/gm)) {
-    const name = match[1].replace(/^["']|["']$/g, '')
-    if (name && !seen.has(name)) {
-      seen.add(name)
-      names.push(name)
-    }
-  }
-  return names
-}
-
-// Pre-flight checks for Docker deployment
-async function checkDockerPrerequisites() {
-  const checks = {
-    docker: false,
-    dockerCompose: false,
-    internetConnection: false,
-  }
-  
-  try {
-    await execAsync('docker --version')
-    checks.docker = true
-  } catch {
-    // Docker not available
-  }
-  
-  try {
-    await execAsync('docker compose version')
-    checks.dockerCompose = true
-  } catch {
-    // Docker Compose not available
-  }
-  
-  // Multi-layered internet connectivity check
-  checks.internetConnection = await checkInternetConnectivity()
-  
-  return checks
-}
-
-// Improved internet connectivity check using multiple methods
-async function checkInternetConnectivity(): Promise<boolean> {
-  // Method 1: HTTP connectivity test to multiple reliable endpoints
-  const httpEndpoints = [
-    'https://www.google.com',
-    'https://1.1.1.1', // Cloudflare DNS
-    'https://8.8.8.8', // Google DNS
-  ]
-  
-  for (const endpoint of httpEndpoints) {
-    try {
-      // Use curl for HTTP connectivity test with short timeout
-      await execAsync(`curl -s --max-time 10 --head ${endpoint}`, { timeout: 15000 })
-      return true // If any endpoint succeeds, we have internet
-    } catch {
-      // Try next endpoint
-      continue
-    }
-  }
-  
-  // Method 2: DNS resolution test
-  try {
-    await execAsync('nslookup google.com', { timeout: 10000 })
-    return true
-  } catch {
-    // DNS resolution failed
-  }
-  
-  // Method 3: Ping test (as fallback)
-  try {
-    const pingCommand = process.platform === 'win32' 
-      ? 'ping -n 1 8.8.8.8' 
-      : 'ping -c 1 8.8.8.8'
-    await execAsync(pingCommand, { timeout: 10000 })
-    return true
-  } catch {
-    // Ping failed
-  }
-  
-  // Method 4: Docker registry connectivity (original method as last resort)
-  try {
-    await execAsync('docker pull alpine:latest', { 
-      timeout: 30000,
-      maxBuffer: 1024 * 1024 * 5 // 5MB buffer for Docker pull
-    })
-    return true
-  } catch {
-    // All methods failed
-  }
-  
-  return false
 }
 
 // Accepts either a plain repository URL or a full `git clone ...` command as
@@ -548,57 +451,14 @@ export async function createProject(name: string, userId: string, description?: 
       },
     })
     
-    // Create project directory
+    // Copy the release's docker/ directory unmodified. Per-project container
+    // names, the compose project name and the realtime alias come from the
+    // generated override (see lib/engine/override.ts), not from rewriting
+    // upstream's docker-compose.yml.
     const projectDir = path.join(process.cwd(), 'supabase-projects', slug)
     const coreDockerDir = path.join(process.cwd(), 'supabase-core', 'docker')
-    
-    // Copy docker folder from supabase-core
-    await fs.mkdir(projectDir, { recursive: true })
-    
-    // Use cross-platform copy command
-    const isWindows = process.platform === 'win32'
-    const copyCommand = isWindows 
-      ? `xcopy "${coreDockerDir}" "${path.join(projectDir, 'docker')}" /E /I /H /K`
-      : `cp -r "${coreDockerDir}" "${projectDir}/"`
-      
-    await execAsync(copyCommand)
-    
-    // Customize docker-compose.yml with unique container names
-    const dockerComposeFile = path.join(projectDir, 'docker', 'docker-compose.yml')
-    let dockerComposeContent = await fs.readFile(dockerComposeFile, 'utf8')
-    
-    // Replace container names with project-specific names. Names are read from
-    // the compose file itself so new/renamed upstream services (for example
-    // supabase-kong becoming supabase-envoy) are handled without code changes.
-    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const dockerDir = await engine.copyDockerTemplate(coreDockerDir, projectDir)
 
-    for (const containerName of extractContainerNames(dockerComposeContent)) {
-      const suffix = containerName
-        .replace(/^supabase-/, '')
-        .replace(/^realtime-dev\./, '')
-      // The slug generator strips leading and trailing dashes, so the slug is
-      // already a valid Docker container name (alphanumeric first character).
-      // No further sanitization is needed here.
-      const replacement = containerName.startsWith('realtime-dev.')
-        ? `realtime-dev.${slug}-${suffix}`
-        : `${slug}-${suffix}`
-
-      dockerComposeContent = dockerComposeContent.replace(
-        new RegExp(`(container_name:\\s*)${escapeRegExp(containerName)}\\b`, 'g'),
-        `$1${replacement}`
-      )
-    }
-
-    // Update the compose project name to be unique
-    dockerComposeContent = dockerComposeContent.replace(
-      /^name:\s*\S+\s*$/m,
-      `name: ${slug}`
-    )
-    
-    
-    // Write the modified docker-compose.yml back
-    await fs.writeFile(dockerComposeFile, dockerComposeContent)
-    
     // Generate unique default port values to prevent conflicts between projects.
     // Each key is offset from a per-project base so concurrent projects never collide.
     const basePort = 8000 + (timestamp % 10000)
@@ -699,12 +559,29 @@ export async function createProject(name: string, userId: string, description?: 
     }
     
     // Write initial .env file with unique defaults
-    const envFilePath = path.join(projectDir, 'docker', '.env')
+    const envFilePath = path.join(dockerDir, '.env')
     const envContent = Object.entries(defaultEnvVars)
       .map(([key, value]) => `${key}=${value}`)
       .join('\n')
     
     await fs.writeFile(envFilePath, envContent)
+
+    // Mark the project as override-layout (compose project = slug) and render
+    // its override now, so the directory is complete before the first deploy.
+    // Deploy re-renders it from the compose file on disk, so a failure here
+    // (rendering asks the docker CLI for the service list) doesn't fail the
+    // create, which never needed Docker before.
+    await engine.writeProjectMeta(dockerDir, {
+      layout: 'override',
+      composeProject: slug,
+      profile: 'persistent',
+      createdAt: new Date(timestamp).toISOString(),
+    })
+    try {
+      await engine.writeOverride(await engine.resolveTarget(dockerDir, slug))
+    } catch (renderError) {
+      console.warn('Could not render the compose override yet; deploy will render it:', renderError)
+    }
     
     // Save environment variables to database
     for (const [key, value] of Object.entries(defaultEnvVars)) {
@@ -790,11 +667,11 @@ export async function deployProject(projectId: string) {
       throw new Error('Project not found')
     }
     
-    const projectDir = path.join(process.cwd(), 'supabase-projects', project.slug, 'docker')
+    const dockerDir = path.join(process.cwd(), 'supabase-projects', project.slug, 'docker')
     
     // Run pre-flight checks
     console.log('Running pre-flight checks...')
-    const checks = await checkDockerPrerequisites()
+    const checks = await engine.checkDockerPrerequisites()
     
     if (!checks.docker) {
       throw new Error('Docker is not installed or not running. Please install Docker Desktop and ensure it is started before deploying.')
@@ -803,6 +680,12 @@ export async function deployProject(projectId: string) {
     if (!checks.dockerCompose) {
       throw new Error('Docker Compose is not available. Please ensure Docker Desktop includes Docker Compose or install it separately.')
     }
+
+    // New projects get their override re-rendered from the compose file on
+    // disk; legacy projects (rewritten compose file) get the realtime-alias
+    // override and keep their compose project and container names.
+    const target = await engine.resolveTarget(dockerDir, project.slug)
+    await engine.writeOverride(target)
     
     // Try to run Docker commands with better error handling
     try {
@@ -810,11 +693,7 @@ export async function deployProject(projectId: string) {
       if (checks.internetConnection) {
         console.log('Attempting to pull latest Docker images...')
         try {
-          await execAsync('docker compose pull', { 
-            cwd: projectDir, 
-            timeout: 300000, // 5 minute timeout
-            maxBuffer: 1024 * 1024 * 10 // 10MB buffer
-          })
+          await engine.pull(target)
         } catch (pullError) {
           console.warn('Failed to pull some images, will try to use existing/cached images:', pullError)
           // Continue with deployment even if pull fails
@@ -825,11 +704,7 @@ export async function deployProject(projectId: string) {
       
       // Start the services
       console.log('Starting Supabase services...')
-      await execAsync('docker compose up -d --remove-orphans', { 
-        cwd: projectDir, 
-        timeout: 300000, // 5 minute timeout
-        maxBuffer: 1024 * 1024 * 10 // 10MB buffer
-      })
+      await engine.up(target)
       
     } catch (composeError) {
       // If the main docker compose command fails, provide better error message
@@ -852,12 +727,8 @@ export async function deployProject(projectId: string) {
     
     // Verify that containers are running
     try {
-      const { stdout } = await execAsync('docker compose ps --format json', { 
-        cwd: projectDir,
-        maxBuffer: 1024 * 1024 * 2 // 2MB buffer for container status
-      })
-      const containers = JSON.parse(`[${stdout.trim().split('\n').join(',')}]`)
-      const runningContainers = containers.filter((c: { State: string }) => c.State === 'running')
+      const containers = await engine.ps(target)
+      const runningContainers = containers.filter((c) => c.State === 'running')
       console.log(`Deployment successful: ${runningContainers.length} containers running`)
     } catch {
       console.warn('Could not verify container status, but deployment may have succeeded')
@@ -886,10 +757,10 @@ export async function pauseProject(projectId: string) {
       throw new Error('Project not found')
     }
     
-    const projectDir = path.join(process.cwd(), 'supabase-projects', project.slug, 'docker')
+    const dockerDir = path.join(process.cwd(), 'supabase-projects', project.slug, 'docker')
     
     // Stop Docker containers
-    await execAsync('docker compose stop', { cwd: projectDir })
+    await engine.stop(await engine.resolveTarget(dockerDir, project.slug))
     
     // Update project status
     await prisma.project.update({
@@ -914,50 +785,24 @@ export async function deleteProject(projectId: string) {
       throw new Error('Project not found')
     }
 
-    const projectDir = path.join(process.cwd(), 'supabase-projects', project.slug)
+    const projectsRoot = path.join(process.cwd(), 'supabase-projects')
+    const projectDir = path.join(projectsRoot, project.slug)
     const dockerDir = path.join(projectDir, 'docker')
 
-    // Step 1: Stop and remove Docker containers
+    // Step 1: Stop and remove Docker containers, volumes and networks, under
+    // the same compose project and files the project was deployed with.
     try {
       console.log(`Stopping Docker containers for project ${project.slug}...`)
-      await execAsync('docker compose down --volumes --remove-orphans', {
-        cwd: dockerDir,
-        timeout: 120000, // 2 minutes timeout
-        maxBuffer: 1024 * 1024 * 5 // 5MB buffer
-      })
+      await engine.down(await engine.resolveTarget(dockerDir, project.slug))
     } catch (dockerError) {
       console.warn('Failed to stop Docker containers (they may not be running):', dockerError)
       // Continue with deletion even if Docker cleanup fails
     }
 
-    // Step 2: Remove project directory. The plain rm path still works on hosts
-    // where the service runs as root, and is the simplest cleanup on macOS or
-    // on hosts without bind-mounts. On Linux hosts running this app as a
-    // non-root service user, the docker bind-mount target dirs (e.g.
-    // supabase-projects/<slug>/docker/volumes/db/data) end up owned by the
-    // container's internal UID (often a system account like dhcpcd), so the
-    // service user can't remove them directly. In that case we fall back to a
-    // throwaway container running as root, which has the access to the bind-
-    // mount source dirs that the service user lacks.
-    try {
-      console.log(`Removing project directory: ${projectDir}`)
-      const isWindows = process.platform === 'win32'
-      if (isWindows) {
-        await execAsync(`rmdir /s /q "${projectDir}"`, { timeout: 60000 })
-      } else {
-        await execFileAsync('rm', ['-rf', '--', projectDir], { timeout: 60000 })
-      }
-    } catch (fsError) {
-      if (process.platform !== 'win32') {
-        const stillExists = await fs.access(projectDir).then(() => true).catch(() => false)
-        if (stillExists) {
-          console.warn(`Plain rm failed for ${projectDir}; falling back to docker helper for bind-mount cleanup`)
-          await removeProjectDirViaDocker(projectDir)
-        }
-      } else {
-        console.warn('Failed to remove project directory:', fsError)
-      }
-    }
+    // Step 2: Remove project directory (with a root-in-a-container fallback
+    // for bind-mount dirs the service user can't delete; see engine/files.ts).
+    console.log(`Removing project directory: ${projectDir}`)
+    await engine.removeProjectDir(projectDir, projectsRoot)
 
     // Step 3: Clean up database records
     try {
@@ -980,65 +825,5 @@ export async function deleteProject(projectId: string) {
   } catch (error) {
     console.error('Failed to delete project:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
-  }
-}
-
-// Remove a project directory using a one-shot root-in-a-container helper.
-// Used when the service user can't delete docker bind-mount source dirs
-// directly (see the comment in deleteProject). Mounts the projects root
-// (resolved relative to cwd), not the entire SupaConsole tree, so a stray
-// path can't reach prisma/supaconsole.db or supabase-core. The slug is
-// validated against a strict regex and a containment check against the
-// resolved projects root before the helper is invoked.
-const PROJECTS_ROOT_NAME = 'supabase-projects'
-const CLEANUP_IMAGE = 'alpine:3.20'
-// Slugs come from `createProject`, which lower-cases the name, replaces runs
-// of non-[a-z0-9] with '-', and strips leading and trailing dashes. Legacy
-// slugs in the database may still start with '-' (predating that change);
-// the regex keeps accepting them so cleanup stays correct for old data.
-// Empty, '.', and '..' are rejected explicitly.
-const SLUG_RE = /^[a-z0-9-]+$/
-
-async function removeProjectDirViaDocker(projectDir: string): Promise<void> {
-  const cwd = process.cwd()
-  const projectsRoot = path.resolve(cwd, PROJECTS_ROOT_NAME)
-  const resolved = path.resolve(projectDir)
-  const slug = path.basename(resolved)
-
-  if (slug === '' || slug === '.' || slug === '..' || !SLUG_RE.test(slug)) {
-    throw new Error(`Refusing to clean up project directory: slug "${slug}" is not a valid slug`)
-  }
-  if (path.dirname(resolved) !== projectsRoot) {
-    throw new Error(
-      `Refusing to clean up project directory: ${resolved} is not a direct child of ${projectsRoot}`
-    )
-  }
-
-  // Best-effort pull of a pinned image; ignore failure so the helper can
-  // still run if the registry is unreachable and the image is already local.
-  try {
-    await execFileAsync('docker', ['pull', '--quiet', CLEANUP_IMAGE], { timeout: 120000 })
-  } catch (pullError) {
-    console.warn(`docker pull ${CLEANUP_IMAGE} failed (continuing if image is local):`, pullError)
-  }
-
-  // Mount only the projects root, not cwd, and use execFile (not a shell
-  // string) so the slug cannot break out of the mount. The `--` ends rm's
-  // option parsing so a slug that happens to look like a flag (e.g. `-r`)
-  // is treated as a path.
-  await execFileAsync(
-    'docker',
-    [
-      'run', '--rm',
-      '-v', `${projectsRoot}:/projects`,
-      CLEANUP_IMAGE,
-      'rm', '-rf', '--', `/projects/${slug}`,
-    ],
-    { timeout: 120000 }
-  )
-
-  const stillExists = await fs.access(resolved).then(() => true).catch(() => false)
-  if (stillExists) {
-    throw new Error(`Docker helper ran but ${resolved} still exists`)
   }
 }
