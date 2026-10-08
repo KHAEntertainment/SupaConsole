@@ -1,0 +1,8 @@
+project_id = "preview-sample"
+[db]
+major_version = 17
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql"]
+[functions.echo]
+verify_jwt = true
