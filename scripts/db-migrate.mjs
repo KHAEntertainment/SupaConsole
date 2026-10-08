@@ -11,10 +11,13 @@
 //   - fresh DB (no _prisma_migrations, no app tables): just deploy.
 //   - DB with migration history: just deploy (a no-op when up to date).
 //
+// DATABASE_URL is canonicalized once to an absolute file: URL (relative paths
+// resolve against prisma/ , as Prisma Client and schema-based CLI commands do)
+// and that absolute URL is used for every diff/execute/resolve/deploy.
+//
 // Used by the Dockerfile CMD, ops/vps-setup.sh and `npm run db:migrate`.
 import { execSync } from 'node:child_process'
 import {
-  readFileSync,
   existsSync,
   realpathSync,
   mkdtempSync,
@@ -24,6 +27,9 @@ import {
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import nextEnv from '@next/env'
+
+const { loadEnvConfig } = nextEnv
 
 const APP_TABLES = [
   'users',
@@ -41,32 +47,147 @@ export function decideAction({ hasMigrationsTable, hasAppTables }) {
   return 'deploy'
 }
 
-// Splits a Prisma `migrate diff --script` body into statements. Comments are
-// dropped; anything left over that is not a complete statement fails the
-// additive whitelist later, which is the safe direction.
+// Prisma resolves relative file: URLs against the schema directory (prisma/),
+// while `--url`/`--from-url`/`--to-url` resolve them against the process cwd.
+// Canonicalize once so every consumer sees the same absolute database.
+export function canonicalizeDatabaseUrl(rawUrl, schemaDir) {
+  if (!rawUrl.startsWith('file:')) return rawUrl
+  const rest = rawUrl.slice('file:'.length)
+  const suffixIndex = rest.search(/[?#]/)
+  const filePath = suffixIndex === -1 ? rest : rest.slice(0, suffixIndex)
+  const suffix = suffixIndex === -1 ? '' : rest.slice(suffixIndex)
+  return `file:${path.resolve(schemaDir, filePath)}${suffix}`
+}
+
+// Blanks the contents of single-quoted SQL string literals (keeping the
+// quotes and the exact length) so classification regexes cannot be fooled by
+// `;`, `--` or keywords inside literals. Double-quoted identifiers pass
+// through, because checks like the `new_` table artifact need them.
+function maskStringLiterals(sql) {
+  let out = ''
+  let i = 0
+  while (i < sql.length) {
+    const c = sql[i]
+    if (c === "'") {
+      out += "'"
+      i++
+      while (i < sql.length) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            out += '  '
+            i += 2
+            continue
+          }
+          out += "'"
+          i++
+          break
+        }
+        out += ' '
+        i++
+      }
+      continue
+    }
+    if (c === '"') {
+      out += c
+      i++
+      while (i < sql.length) {
+        out += sql[i]
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') {
+            out += '"'
+            i += 2
+            continue
+          }
+          i++
+          break
+        }
+        i++
+      }
+      continue
+    }
+    out += c
+    i++
+  }
+  return out
+}
+
+// Splits a Prisma `migrate diff --script` body into statements. Tokenizing is
+// quote- and comment-aware: `;` inside '…' / "…" literals does not split, and
+// `--` / `*//*` comments are dropped (but comment markers inside literals are
+// literal text). Splits only on top-level `;`.
 export function splitSqlStatements(sql) {
-  return sql
-    .replace(/--[^\n]*/g, '')
-    .split(';')
-    .map((statement) => statement.trim())
-    .filter((statement) => statement.length > 0)
+  const statements = []
+  let current = ''
+  let i = 0
+  while (i < sql.length) {
+    const c = sql[i]
+    const next = sql[i + 1]
+    if (c === '-' && next === '-') {
+      while (i < sql.length && sql[i] !== '\n') i++
+      continue
+    }
+    if (c === '/' && next === '*') {
+      i += 2
+      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+    if (c === "'" || c === '"') {
+      const quote = c
+      current += c
+      i++
+      while (i < sql.length) {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
+            current += quote + quote
+            i += 2
+            continue
+          }
+          current += quote
+          i++
+          break
+        }
+        current += sql[i]
+        i++
+      }
+      continue
+    }
+    if (c === ';') {
+      const trimmed = current.trim()
+      if (trimmed) statements.push(trimmed)
+      current = ''
+      i++
+      continue
+    }
+    current += c
+    i++
+  }
+  const trimmed = current.trim()
+  if (trimmed) statements.push(trimmed)
+  return statements
 }
 
 // Additive-only whitelist: the change may not lose or rewrite anything that
 // already exists. `CREATE TABLE "new_...` is the RedefineTables artifact of a
-// table rebuild and is refused even though it starts with CREATE TABLE.
+// table rebuild and `CREATE TABLE ... AS SELECT` copies data; both are refused
+// even though they start with CREATE TABLE.
 export function isAdditiveStatement(statement) {
   const sql = statement.trim()
+  const masked = maskStringLiterals(sql)
   if (/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?new_/i.test(sql)) return false
-  if (/^CREATE\s+TABLE\s/i.test(sql)) return true
-  if (/^CREATE\s+(?:UNIQUE\s+)?INDEX\s/i.test(sql)) return true
-  if (/^ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMN\s/i.test(sql)) return true
+  if (/^CREATE\s+TABLE\b/i.test(masked)) {
+    return !/\bAS\s+SELECT\b/i.test(masked)
+  }
+  if (/^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(masked)) return true
+  if (/^ALTER\s+TABLE\b/i.test(masked) && /\bADD\s+COLUMN\b/i.test(masked)) {
+    return true
+  }
   return false
 }
 
 // Classifies a schema-diff script as 'empty' (schemas match), 'additive'
 // (safe to apply: ADD COLUMN / CREATE TABLE / CREATE INDEX only) or 'unsafe'
-// (DROP, RedefineTables, rewrites, unknown statements).
+// (DROP, RedefineTables, CTAS, rewrites, unknown statements).
 export function classifyDiffScript(sql) {
   const statements = splitSqlStatements(sql)
   if (statements.length === 0) return { kind: 'empty', statements }
@@ -76,28 +197,6 @@ export function classifyDiffScript(sql) {
     }
   }
   return { kind: 'additive', statements }
-}
-
-function loadEnvFiles(dir) {
-  for (const name of ['.env', '.env.local']) {
-    const file = path.join(dir, name)
-    if (!existsSync(file)) continue
-    for (const rawLine of readFileSync(file, 'utf8').split('\n')) {
-      const line = rawLine.trim()
-      if (!line || line.startsWith('#')) continue
-      const eq = line.indexOf('=')
-      if (eq === -1) continue
-      const key = line.slice(0, eq).trim()
-      let value = line.slice(eq + 1).trim()
-      if (
-        (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
-        (value.startsWith("'") && value.endsWith("'") && value.length > 1)
-      ) {
-        value = value.slice(1, -1)
-      }
-      if (key && !(key in process.env)) process.env[key] = value
-    }
-  }
 }
 
 async function inspectTables() {
@@ -119,14 +218,17 @@ function q(value) {
   return `"${String(value).replace(/(["\\$`])/g, '\\$1')}"`
 }
 
-// Runs the local Prisma CLI directly (node node_modules/prisma/...) when it is
-// installed — `npx prisma` pays npm resolution overhead on every call. Falls
-// back to npx if node_modules is not laid out as expected.
+// Runs the installed Prisma CLI directly (node node_modules/prisma/...).
+// There is no npx fallback: a missing local CLI is a broken install and must
+// fail loudly instead of resolving some other version.
 function prismaBin(cwd) {
   const local = path.join(cwd, 'node_modules', 'prisma', 'build', 'index.js')
-  return existsSync(local)
-    ? `${q(process.execPath)} ${q(local)}`
-    : 'npx prisma'
+  if (!existsSync(local)) {
+    throw new Error(
+      `local Prisma CLI not found at ${local} (run npm ci in ${cwd})`
+    )
+  }
+  return `${q(process.execPath)} ${q(local)}`
 }
 
 function prismaCli(args, cwd) {
@@ -146,7 +248,9 @@ function prismaCliOutput(args, cwd) {
 // baselined, using only additive statements. The difference is computed
 // against a scratch DB that holds exactly 0_init (NOT schema.prisma, which
 // will be ahead of 0_init once later migrations exist). Anything non-additive
-// aborts before a single statement is applied to the legacy DB.
+// aborts before a single statement is applied to the legacy DB, and the
+// additive batch runs inside one SQLite transaction so a late failure (e.g. a
+// unique index rejected by duplicate rows) rolls everything back.
 function convergeLegacyToBaseline(url, repoRoot) {
   const migrationSql = path.join(
     repoRoot,
@@ -190,7 +294,7 @@ function convergeLegacyToBaseline(url, repoRoot) {
     )
     console.log(diff.trim())
     const convergeSql = path.join(tmpDir, 'converge.sql')
-    writeFileSync(convergeSql, diff)
+    writeFileSync(convergeSql, `BEGIN;\n${diff}\nCOMMIT;\n`)
     prismaCli(`db execute --file ${q(convergeSql)} --url ${q(url)}`, repoRoot)
     console.log('[db-migrate] additive schema updates applied')
   } finally {
@@ -200,7 +304,12 @@ function convergeLegacyToBaseline(url, repoRoot) {
 
 export async function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-  loadEnvFiles(repoRoot)
+  const schemaDir = path.join(repoRoot, 'prisma')
+
+  // Same file set and precedence as the Next.js app; exported process vars
+  // stay authoritative.
+  loadEnvConfig(repoRoot, process.env.NODE_ENV !== 'production')
+
   if (!process.env.DATABASE_URL) {
     console.error(
       'db-migrate: DATABASE_URL is not set (export it or put it in .env)'
@@ -208,7 +317,8 @@ export async function main() {
     process.exit(1)
   }
 
-  const url = process.env.DATABASE_URL
+  const url = canonicalizeDatabaseUrl(process.env.DATABASE_URL, schemaDir)
+  process.env.DATABASE_URL = url
   console.log(`[db-migrate] database: ${url}`)
 
   const tables = await inspectTables()

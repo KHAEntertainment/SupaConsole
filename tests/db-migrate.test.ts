@@ -1,5 +1,7 @@
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  canonicalizeDatabaseUrl,
   classifyDiffScript,
   decideAction,
   isAdditiveStatement,
@@ -18,6 +20,42 @@ describe('decideAction', () => {
   it('deploys when migration history already exists', () => {
     expect(decideAction({ hasMigrationsTable: true, hasAppTables: true })).toBe('deploy')
     expect(decideAction({ hasMigrationsTable: true, hasAppTables: false })).toBe('deploy')
+  })
+})
+
+describe('canonicalizeDatabaseUrl', () => {
+  const schemaDir = path.resolve('/repo/prisma')
+
+  it('resolves ./relative file: URLs against the schema directory', () => {
+    expect(canonicalizeDatabaseUrl('file:./dev.db', schemaDir)).toBe(
+      `file:${path.resolve(schemaDir, 'dev.db')}`
+    )
+  })
+
+  it('resolves bare relative file: URLs against the schema directory', () => {
+    expect(canonicalizeDatabaseUrl('file:dev.db', schemaDir)).toBe(
+      `file:${path.resolve(schemaDir, 'dev.db')}`
+    )
+  })
+
+  it('keeps absolute file: URLs as-is (normalizing file:/// forms)', () => {
+    expect(canonicalizeDatabaseUrl('file:/abs/x.db', schemaDir)).toBe('file:/abs/x.db')
+    expect(canonicalizeDatabaseUrl('file:///abs/x.db', schemaDir)).toBe('file:/abs/x.db')
+  })
+
+  it('resolves ../ relative to the schema directory and keeps URL suffixes', () => {
+    expect(canonicalizeDatabaseUrl('file:../data/x.db', schemaDir)).toBe(
+      `file:${path.resolve(schemaDir, '..', 'data', 'x.db')}`
+    )
+    expect(canonicalizeDatabaseUrl('file:./x.db?bind=1', schemaDir)).toBe(
+      `file:${path.resolve(schemaDir, 'x.db')}?bind=1`
+    )
+  })
+
+  it('leaves non-file URLs untouched', () => {
+    expect(canonicalizeDatabaseUrl('postgresql://localhost/db', schemaDir)).toBe(
+      'postgresql://localhost/db'
+    )
   })
 })
 
@@ -48,7 +86,39 @@ describe('classifyDiffScript', () => {
     expect(verdict.statements).toHaveLength(4)
   })
 
-  it('rejects DROP statements', () => {
+  it('accepts an additive statement whose DEFAULT literal contains a semicolon', () => {
+    const sql = `ALTER TABLE "t" ADD COLUMN "c" TEXT DEFAULT 'a;b';`
+    const verdict = classifyDiffScript(sql)
+    expect(verdict.kind).toBe('additive')
+    expect(verdict.statements).toHaveLength(1)
+  })
+
+  it('accepts additive statements with comments around the keywords', () => {
+    const verdict = classifyDiffScript(
+      `/* c1 */ CREATE /* c2 */ TABLE "x" ("v" TEXT DEFAULT 'x;y'); -- done\n`
+    )
+    expect(verdict.kind).toBe('additive')
+  })
+
+  it('refuses the crafted comment-marker-in-literal statement pair', () => {
+    // Naive comment stripping turns "DEFAULT '--'" into an open string and
+    // hides the DROP; the tokenizer must see both statements and refuse.
+    const sql = `CREATE TABLE x(v TEXT DEFAULT '--'); DROP TABLE users;`
+    const verdict = classifyDiffScript(sql)
+    expect(verdict.kind).toBe('unsafe')
+    expect(verdict.statements).toHaveLength(2)
+  })
+
+  it('refuses CREATE TABLE ... AS SELECT', () => {
+    expect(
+      classifyDiffScript('CREATE TABLE "x" AS SELECT * FROM "users";').kind
+    ).toBe('unsafe')
+    expect(
+      classifyDiffScript('CREATE TABLE "x" AS\n  SELECT "id" FROM "users";').kind
+    ).toBe('unsafe')
+  })
+
+  it('refuses DROP statements', () => {
     const verdict = classifyDiffScript('DROP TABLE "legacy_notes";')
     expect(verdict.kind).toBe('unsafe')
     expect(verdict.rejected).toContain('DROP TABLE')
@@ -87,6 +157,16 @@ describe('classifyDiffScript', () => {
     expect(
       isAdditiveStatement('CREATE UNIQUE INDEX "projects_slug_key" ON "projects"("slug")')
     ).toBe(true)
+  })
+
+  it('splits only on top-level semicolons, respecting quotes', () => {
+    const statements = splitSqlStatements(
+      `ALTER TABLE "a" ADD COLUMN "b" TEXT DEFAULT 'x;y';\n` +
+        `CREATE TABLE "c;odd" ("d" TEXT DEFAULT '--');\n`
+    )
+    expect(statements).toHaveLength(2)
+    expect(statements[0]).toMatch(/^ALTER TABLE/)
+    expect(statements[1]).toContain(`DEFAULT '--'`)
   })
 
   it('splits statements and drops comments', () => {
