@@ -99,8 +99,11 @@ adds the variable, removing it takes it back to bootstrap), and reload between
 changes:
 
 ```sh
-# Enable open registration for the e2e window:
-ssh root@<host> 'mkdir -p /etc/systemd/system/supaconsole.service.d && echo "Environment=ALLOW_REGISTRATION=true" > /etc/systemd/system/supaconsole.service.d/allow-registration.conf && systemctl daemon-reload && systemctl restart supaconsole'
+# Enable open registration for the e2e window. A drop-in file MUST name its
+# section (here [Service]) for partial overrides to merge into the parent
+# unit; a bare `Environment=` line without a section header is treated as a
+# whole-unit replacement and silently drops everything else.
+ssh root@<host> 'mkdir -p /etc/systemd/system/supaconsole.service.d && printf "[Service]\nEnvironment=ALLOW_REGISTRATION=true\n" > /etc/systemd/system/supaconsole.service.d/allow-registration.conf && systemctl daemon-reload && systemctl restart supaconsole'
 # ...run ops/e2e.sh setup / deploy / verify / delete ...
 # Disable:
 ssh root@<host> 'rm -f /etc/systemd/system/supaconsole.service.d/allow-registration.conf && systemctl daemon-reload && systemctl restart supaconsole'

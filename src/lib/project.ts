@@ -566,9 +566,16 @@ export async function createProject(name: string, userId: string, description?: 
       const suffix = containerName
         .replace(/^supabase-/, '')
         .replace(/^realtime-dev\./, '')
+      // Docker container names must start with an alphanumeric character.
+      // Slugs can legitimately start with '-' (e.g. a project named '_demo'
+      // becomes '-demo-<timestamp>'), so for the non-realtime services we
+      // strip the leading dashes. The realtime services are prefixed with
+      // 'realtime-dev.' so the first character is 'r' regardless of the
+      // slug, and we leave that path unchanged.
+      const nameSlug = slug.replace(/^-+/, '') || 'p'
       const replacement = containerName.startsWith('realtime-dev.')
         ? `realtime-dev.${slug}-${suffix}`
-        : `${slug}-${suffix}`
+        : `${nameSlug}-${suffix}`
 
       dockerComposeContent = dockerComposeContent.replace(
         new RegExp(`(container_name:\\s*)${escapeRegExp(containerName)}\\b`, 'g'),
