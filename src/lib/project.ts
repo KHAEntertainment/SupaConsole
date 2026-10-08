@@ -514,9 +514,19 @@ export async function initializeSupabaseCore(): Promise<
 
 export async function createProject(name: string, userId: string, description?: string) {
   try {
-    // Generate unique slug
+    // Generate unique slug. Replace non-[a-z0-9] runs with a single '-', then
+    // strip leading and trailing dashes so the result is always safe to use as
+    // a Docker container/compose name (which must start with an alphanumeric
+    // character). Two names that collapse to the same base (e.g. 'demo' and
+    // '_demo') will collide; the timestamp plus the DB unique constraint on
+    // slug means a same-ms collision now fails the create instead of merging
+    // stacks. Empty bases fall back to 'project'.
     const timestamp = Date.now()
-    const slug = `${name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${timestamp}`
+    const baseSlug = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+    const slug = `${baseSlug || 'project'}-${timestamp}`
 
     // Record which Supabase release this project's docker files come from. The
     // ref is recorded only when the checkout verifies against it (meta at its
@@ -566,16 +576,12 @@ export async function createProject(name: string, userId: string, description?: 
       const suffix = containerName
         .replace(/^supabase-/, '')
         .replace(/^realtime-dev\./, '')
-      // Docker container names must start with an alphanumeric character.
-      // Slugs can legitimately start with '-' (e.g. a project named '_demo'
-      // becomes '-demo-<timestamp>'), so for the non-realtime services we
-      // strip the leading dashes. The realtime services are prefixed with
-      // 'realtime-dev.' so the first character is 'r' regardless of the
-      // slug, and we leave that path unchanged.
-      const nameSlug = slug.replace(/^-+/, '') || 'p'
+      // The slug generator strips leading and trailing dashes, so the slug is
+      // already a valid Docker container name (alphanumeric first character).
+      // No further sanitization is needed here.
       const replacement = containerName.startsWith('realtime-dev.')
         ? `realtime-dev.${slug}-${suffix}`
-        : `${nameSlug}-${suffix}`
+        : `${slug}-${suffix}`
 
       dockerComposeContent = dockerComposeContent.replace(
         new RegExp(`(container_name:\\s*)${escapeRegExp(containerName)}\\b`, 'g'),
@@ -986,11 +992,11 @@ export async function deleteProject(projectId: string) {
 // resolved projects root before the helper is invoked.
 const PROJECTS_ROOT_NAME = 'supabase-projects'
 const CLEANUP_IMAGE = 'alpine:3.20'
-// Slugs come from `createProject`, which lower-cases the slug and replaces
-// non-[a-z0-9-] with `-`. The result can legitimately start with `-` (e.g.
-// a project named `_demo` becomes `-demo`, or one named `日本語` becomes
-// only `-`s); `path.basename` always returns at least one char so a leading
-// `-` is the only edge case. Empty, `.`, and `..` are rejected explicitly.
+// Slugs come from `createProject`, which lower-cases the name, replaces runs
+// of non-[a-z0-9] with '-', and strips leading and trailing dashes. Legacy
+// slugs in the database may still start with '-' (predating that change);
+// the regex keeps accepting them so cleanup stays correct for old data.
+// Empty, '.', and '..' are rejected explicitly.
 const SLUG_RE = /^[a-z0-9-]+$/
 
 async function removeProjectDirViaDocker(projectDir: string): Promise<void> {

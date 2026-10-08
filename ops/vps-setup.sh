@@ -54,22 +54,37 @@ WAN_IF=$(ip route show default | awk '{print $5; exit}')
 # shell under `set -u`, so an unescaped reference would abort setup.)
 cat > "${DOCKER_USER_LOCKDOWN}" <<SCRIPT
 #!/bin/sh
+# Fail fast on any iptables error. set -u catches typos; set -e exits on the
+# first non-zero iptables call so a half-applied swap cannot leave the WAN
+# interface without a DROP. CHAIN is parameterised so the test stub can
+# redirect to a scratch chain.
+set -eu
 WAN_IF=\$(ip route show default | awk '{print \$5; exit}')
 [ -n "\$WAN_IF" ] || exit 1
 GUARD_COMMENT=docker-user-lockdown-guard
+CHAIN="\${CHAIN:-DOCKER-USER}"
 for ipt in iptables ip6tables; do
-  \$ipt -n -L DOCKER-USER >/dev/null 2>&1 || continue
-  # Guard-first swap: a plain delete-then-insert would leave the WAN interface
-  # briefly without a DROP. Insert a temporary guard at position 1 marked with
-  # a comment, swap the rules around it, then remove the guard by its marker
-  # so the comment is the only thing distinguishing it from the real DROP.
-  # Unrelated rules lower in the chain are left untouched.
-  \$ipt -I DOCKER-USER 1 -i "\$WAN_IF" -j DROP -m comment --comment "\$GUARD_COMMENT"
-  while \$ipt -D DOCKER-USER -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null; do :; done
-  while \$ipt -D DOCKER-USER -i "\$WAN_IF" -j DROP 2>/dev/null; do :; done
-  \$ipt -I DOCKER-USER 1 -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-  \$ipt -I DOCKER-USER 2 -i "\$WAN_IF" -j DROP
-  while \$ipt -D DOCKER-USER -i "\$WAN_IF" -j DROP -m comment --comment "\$GUARD_COMMENT" 2>/dev/null; do :; done
+  \$ipt -w -n -L "\$CHAIN" >/dev/null 2>&1 || continue
+  # Guard-first swap. Insert the comment-tagged guard at position 1; any
+  # failure here aborts before any deletion, so the chain is unchanged. -w
+  # takes the xtables lock exclusively so a concurrent iptables caller
+  # can't observe a torn state.
+  \$ipt -w -I "\$CHAIN" 1 -i "\$WAN_IF" -j DROP -m comment --comment "\$GUARD_COMMENT"
+  # Remove the existing RETURN/DROP pair. The guard is tagged, so it is
+  # invisible to these deletion patterns; the while loops are bounded by
+  # the loop's exit when the deletion finds nothing to remove.
+  while \$ipt -w -D "\$CHAIN" -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null; do :; done
+  while \$ipt -w -D "\$CHAIN" -i "\$WAN_IF" -j DROP 2>/dev/null; do :; done
+  # Insert the permanent RETURN/DROP. set -e fails the script if either
+  # insert fails, so the guard is preserved and the chain keeps a DROP.
+  \$ipt -w -I "\$CHAIN" 1 -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  \$ipt -w -I "\$CHAIN" 2 -i "\$WAN_IF" -j DROP
+  # Verify both permanent rules are present before removing the guard. If
+  # either is missing, set -e exits and the guard stays put.
+  \$ipt -w -C "\$CHAIN" -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  \$ipt -w -C "\$CHAIN" -i "\$WAN_IF" -j DROP
+  # Safe to remove the guard now.
+  while \$ipt -w -D "\$CHAIN" -i "\$WAN_IF" -j DROP -m comment --comment "\$GUARD_COMMENT" 2>/dev/null; do :; done
 done
 SCRIPT
 chmod 755 "${DOCKER_USER_LOCKDOWN}"
@@ -155,14 +170,16 @@ fi
 chown -R "${DEV_USER}:${DEV_USER}" "${DEV_HOME}"
 
 step "supaconsole: prepare ${APP_DIR} for the build"
-# Stop any running service so the clone/build below is not racing with a
-# live process holding open files in the tree (especially .next/).
+# Stop any running service so the build below is not racing with a live
+# process holding open files in the tree (especially .next/).
 if systemctl is-active --quiet supaconsole 2>/dev/null; then
   systemctl stop supaconsole
 fi
 mkdir -p "${APP_DIR}"
-# A writable HOME for the build. ${SVC_USER} has no login shell and no home
-# dir (--no-create-home), so npm/prisma need HOME pointed at a path they own.
+chown -R "${SVC_USER}:${SVC_USER}" "${APP_DIR}"
+# A writable HOME for git/npm/prisma. ${SVC_USER} has no login shell and no
+# home dir (--no-create-home), so the build env needs HOME pointed at a path
+# they own.
 SVC_HOME=/var/lib/supaconsole
 install -d -o "${SVC_USER}" -g "${SVC_USER}" -m 0755 "${SVC_HOME}"
 # Remove the things a build produces so a rebuild from a clean slate is
@@ -170,25 +187,24 @@ install -d -o "${SVC_USER}" -g "${SVC_USER}" -m 0755 "${SVC_HOME}"
 # from scratch.
 rm -rf "${APP_DIR}/supabase-projects" "${APP_DIR}/supabase-core" "${APP_DIR}/.supabase-core-incoming"
 
-step "supaconsole: clone ${BRANCH} (running as root)"
-# Hand the tree to root before any git operations, so a previous run that
-# left it owned by ${SVC_USER} does not produce "dubious ownership" errors
-# on re-run. (Codex finding #2's re-run case.) We chown back to ${SVC_USER}
-# right after the git operations so npm ci and build can write under
-# ${APP_DIR}.
-chown -R root:root "${APP_DIR}"
-if [ ! -d "${APP_DIR}/.git" ]; then
-  git clone -q --branch "${BRANCH}" https://github.com/KHAEntertainment/SupaConsole.git "${APP_DIR}"
-fi
-cd "${APP_DIR}"
-git fetch -q origin "${BRANCH}"
-git checkout -q -B "${BRANCH}" "origin/${BRANCH}"
-git log --oneline -1
+step "supaconsole: clone ${BRANCH} (running as ${SVC_USER})"
+# All git operations run as ${SVC_USER}. Root must NEVER execute git in this
+# tree: a previous build can leave hooks the script itself can't see (planted
+# core.hooksPath, post-checkout hooks), and root executing them runs
+# service-controlled code with full privileges. Running as ${SVC_USER} limits
+# a hook hijack to what the service user can do anyway.
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" \
+  bash -c "set -eu
+    cd '${APP_DIR}'
+    if [ -d .git ]; then
+      git fetch -q origin '${BRANCH}'
+      git checkout -q -B '${BRANCH}' 'origin/${BRANCH}'
+    else
+      git clone -q --branch '${BRANCH}' https://github.com/KHAEntertainment/SupaConsole.git .
+    fi
+    git log --oneline -1"
 
 step "supaconsole: install, prisma, build (running as ${SVC_USER})"
-# Hand the tree to ${SVC_USER} so node_modules, .next, and the Prisma client
-# all land owned by the service user from the start.
-chown -R "${SVC_USER}:${SVC_USER}" "${APP_DIR}"
 runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
   bash -c "cd '${APP_DIR}' && npm ci --no-audit --no-fund --loglevel=error"
 runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
