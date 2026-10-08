@@ -25,12 +25,12 @@ export async function POST(request: NextRequest) {
 
     if (!result.success) {
       return NextResponse.json(
-        { error: result.error },
-        { status: 500 }
+        { error: result.error, code: result.code },
+        { status: result.code === 'REF_MISMATCH' ? 409 : 500 }
       )
     }
 
-    return NextResponse.json({ success: true })
+    return NextResponse.json({ success: true, ref: result.ref, commit: result.commit })
   } catch (error) {
     console.error('Initialize error:', error)
     return NextResponse.json(

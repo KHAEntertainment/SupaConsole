@@ -1,11 +1,23 @@
 import { promises as fs } from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
-import { exec } from 'child_process'
+import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
 import { prisma } from './db'
 
 const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
+
+// The Supabase release projects are created from. Overridable with
+// SUPABASE_CORE_REF (a tag, branch or commit SHA); this default is upstream's
+// newest self-hosted tag as of 2026-10-05, the release the compatibility fix
+// was tested against (Postgres 17.6.1.136, Envoy v1.39.1, GoTrue v2.196.0,
+// PostgREST v14.17).
+const DEFAULT_CORE_REF = 'self-hosted/v0.8.2'
+
+// Written inside supabase-core/ at clone time so later Initialize calls can
+// tell which ref the checkout is at without guessing from branch names.
+const CORE_META_FILE = '.supaconsole-core.json'
 
 // Helper functions for generating secure defaults
 function generateRandomString(length: number): string {
@@ -182,20 +194,244 @@ async function isUsableSupabaseCore(coreDir: string): Promise<boolean> {
   return fs.access(dockerCompose).then(() => true).catch(() => false)
 }
 
-export async function initializeSupabaseCore() {
+// The configured release ref (tag, branch or commit SHA). Validated here
+// because it is passed to git as an argument.
+async function normalizeCoreRef(raw: string, coreDir: string, repoUrl: string): Promise<string> {
+  const value = raw.trim().replace(/^["']|["']$/g, '')
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) ||
+    value.includes('..') ||
+    value.includes('@{') ||
+    value.endsWith('/') ||
+    value.length > 255
+  ) {
+    throw new Error(`SUPABASE_CORE_REF must be a tag, branch or commit SHA, received: ${value}`)
+  }
+  // A 7-39 character hex string is a short SHA only when it is not also a real
+  // ref name (a tag called `deadbeef` clones fine), so look for an exact
+  // refs/heads/<ref> or refs/tags/<ref> in the existing checkout and on the
+  // remote before refusing. Commit refs are accepted only in full:
+  // `git fetch origin <sha>` only takes full SHAs, and a short SHA of a
+  // historical commit cannot be expanded from advertised refs at all.
+  if (/^[0-9a-fA-F]{7,39}$/.test(value) && !(await isRefName(value, coreDir, repoUrl))) {
+    throw new Error(
+      `SUPABASE_CORE_REF commit SHAs must be the full 40 characters (short SHAs are not supported), received: ${value}`
+    )
+  }
+  return value
+}
+
+async function configuredCoreRef(coreDir: string, repoUrl: string): Promise<string> {
+  return normalizeCoreRef(process.env.SUPABASE_CORE_REF || DEFAULT_CORE_REF, coreDir, repoUrl)
+}
+
+function isCommitSha(ref: string): boolean {
+  return /^[0-9a-fA-F]{40}$/.test(ref)
+}
+
+// Is this exact name a branch or a tag? Checked in the existing checkout and
+// against the remote's advertised refs (exact ref names, no DWIM). Distinguishes
+// a hex-named ref from an abbreviated SHA.
+async function isRefName(ref: string, coreDir: string, repoUrl: string): Promise<boolean> {
+  if (await git(['rev-parse', '--verify', `refs/heads/${ref}`], coreDir)) return true
+  if (await git(['rev-parse', '--verify', `refs/tags/${ref}`], coreDir)) return true
+  const listed = await git(
+    ['ls-remote', repoUrl, `refs/heads/${ref}`, `refs/tags/${ref}`],
+    process.cwd()
+  )
+  if (!listed) return false
+  for (const line of listed.split('\n')) {
+    const match = line.match(/^([0-9a-f]{40})\s+(\S+)$/)
+    if (match && (match[2] === `refs/heads/${ref}` || match[2] === `refs/tags/${ref}`)) return true
+  }
+  return false
+}
+
+// Runs git in the given directory, returning trimmed stdout, or null when the
+// command fails (missing directory, not a git checkout, ref not present...).
+async function git(args: string[], cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', args, {
+      cwd,
+      timeout: 120000,
+      maxBuffer: 10 * 1024 * 1024,
+    })
+    return stdout.trim()
+  } catch {
+    return null
+  }
+}
+
+// Which ref and commit is the local supabase-core checkout at? The meta file
+// written at clone time is authoritative, but only while the checkout is still
+// at the commit it was cloned at: a later checkout, reset or pull to another
+// commit leaves the meta behind, so its ref name no longer describes the files.
+// Without a trustworthy meta (checkouts made by older versions, or by hand)
+// fall back to asking git.
+export interface SupabaseCoreInfo {
+  ref: string | null
+  commit: string | null
+  source: 'meta' | 'git' | 'stale-meta' | 'none'
+}
+
+export async function readSupabaseCoreInfo(coreDir: string): Promise<SupabaseCoreInfo> {
+  const commit = await git(['rev-parse', 'HEAD'], coreDir)
+  try {
+    const raw = await fs.readFile(path.join(coreDir, CORE_META_FILE), 'utf8')
+    const meta = JSON.parse(raw) as { ref?: unknown; commit?: unknown }
+    if (typeof meta.ref === 'string' && meta.ref) {
+      const metaCommit = typeof meta.commit === 'string' ? meta.commit.toLowerCase() : null
+      // Trust the recorded ref only when HEAD is still exactly where the clone
+      // left it; otherwise the meta is stale and the ref is unverifiable.
+      if (metaCommit && commit && metaCommit === commit.toLowerCase()) {
+        return { ref: meta.ref, commit, source: 'meta' }
+      }
+      return { ref: null, commit, source: 'stale-meta' }
+    }
+  } catch {
+    // No meta file: derive the ref from the checkout itself.
+  }
+  // Derive a candidate name (a local branch, else an exact tag) and verify it
+  // resolves back to HEAD under the clone's own precedence; a name that points
+  // elsewhere is ambiguous (a branch and a tag may share it) and is not
+  // recorded.
+  let candidate: string | null = null
+  const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], coreDir)
+  if (branch && branch !== 'HEAD') candidate = branch
+  if (!candidate) candidate = await git(['describe', '--tags', '--exact-match', 'HEAD'], coreDir)
+  if (candidate && commit) {
+    const resolved = await resolveLocalRefCommit(coreDir, candidate)
+    if (resolved && resolved !== 'ambiguous' && resolved.toLowerCase() === commit.toLowerCase()) {
+      return { ref: candidate, commit, source: 'git' }
+    }
+  }
+  return { ref: null, commit, source: 'none' }
+}
+
+// Local half of ref resolution, in the same precedence `git clone --branch`
+// uses: refs/heads/<ref> first, then refs/tags/<ref> peeled to its commit.
+// When there is no local head and a remote-tracking branch and a same-name tag
+// point at different commits, the name is ambiguous: the remote-tracking ref
+// may be stale (upstream may have deleted the branch since), so neither side
+// can be picked safely. Report 'ambiguous' and let callers treat the checkout
+// as unverifiable rather than silently preferring one.
+type LocalRefResolution = string | 'ambiguous' | null
+
+async function resolveLocalRefCommit(coreDir: string, ref: string): Promise<LocalRefResolution> {
+  const head = await git(['rev-parse', '--verify', `refs/heads/${ref}^{commit}`], coreDir)
+  if (head) return head
+  const tracking = await git(['rev-parse', '--verify', `refs/remotes/origin/${ref}^{commit}`], coreDir)
+  const tag = await git(['rev-parse', '--verify', `refs/tags/${ref}^{commit}`], coreDir)
+  if (tracking && tag && tracking.toLowerCase() !== tag.toLowerCase()) return 'ambiguous'
+  return tracking ?? tag
+}
+
+// Resolves a ref name to a commit SHA without cloning: locally first (works
+// offline for refs already fetched), then against the remote with exact ref
+// names. Precedence is explicit and matches `git clone --branch`: heads first,
+// then peeled tags. An ambiguous local name is not resolved from the remote
+// either: the checkout is unverifiable, not wrong-but-guessable.
+async function resolveRefCommit(
+  coreDir: string,
+  repoUrl: string,
+  ref: string
+): Promise<LocalRefResolution> {
+  const local = await resolveLocalRefCommit(coreDir, ref)
+  if (local) return local
+
+  // ls-remote prints the tag object for an annotated tag and its peeled commit
+  // on a separate `^{}` line; match exact ref names rather than taking the
+  // first peeled row seen.
+  const listed = await git(
+    ['ls-remote', repoUrl, `refs/heads/${ref}`, `refs/tags/${ref}`, `refs/tags/${ref}^{}`],
+    process.cwd()
+  )
+  if (!listed) return null
+  const lines = new Map<string, string>()
+  for (const line of listed.split('\n')) {
+    const match = line.match(/^([0-9a-f]{40})\s+(\S+)$/)
+    if (match) lines.set(match[2], match[1])
+  }
+  return (
+    lines.get(`refs/heads/${ref}`) ??
+    lines.get(`refs/tags/${ref}^{}`) ??
+    lines.get(`refs/tags/${ref}`) ??
+    null
+  )
+}
+
+// How does the existing checkout relate to the configured ref?
+//   match     - same ref (or the configured commit SHA); Initialize is a no-op
+//   mismatch  - provably a different ref; report it, never re-clone
+//   unknown   - the checkout's ref cannot be verified against the configured one
+type CoreRefCheck = 'match' | 'mismatch' | 'unknown'
+
+async function checkCoreRef(
+  coreDir: string,
+  info: SupabaseCoreInfo,
+  configuredRef: string,
+  repoUrl: string
+): Promise<CoreRefCheck> {
+  // A stale meta proves nothing about the current checkout: the files on disk
+  // may be anything checked out since the clone. Report unverifiable.
+  if (info.source === 'stale-meta') return 'unknown'
+  // Name equality is only sound for a meta-recorded ref (the clone was made
+  // from exactly this name at exactly this commit); an ambiguous name must go
+  // through resolution below.
+  if (info.source === 'meta' && info.ref === configuredRef) return 'match'
+  if (info.commit && isCommitSha(configuredRef)) {
+    return info.commit.toLowerCase() === configuredRef.toLowerCase() ? 'match' : 'mismatch'
+  }
+  // The configured ref may point at the checkout's commit under another name
+  // (same tag fetched twice, or a commit checked out by another ref).
+  const resolved = await resolveRefCommit(coreDir, repoUrl, configuredRef)
+  if (resolved === 'ambiguous') return 'unknown'
+  if (resolved && info.commit) {
+    return resolved.toLowerCase() === info.commit.toLowerCase() ? 'match' : 'mismatch'
+  }
+  return info.ref !== null ? 'mismatch' : 'unknown'
+}
+
+export async function initializeSupabaseCore(): Promise<
+  | { success: true; ref: string; commit: string | null }
+  | { success: false; error: string; code?: 'REF_MISMATCH' }
+> {
   const coreDir = path.join(process.cwd(), 'supabase-core')
   const projectsDir = path.join(process.cwd(), 'supabase-projects')
   const stagingDir = path.join(process.cwd(), '.supabase-core-incoming')
-  
+
   try {
     const projectsExists = await fs.access(projectsDir).then(() => true).catch(() => false)
-    
+
     if (!projectsExists) {
       await fs.mkdir(projectsDir, { recursive: true })
     }
-    
+
+    const repoUrl = normalizeRepoUrl(
+      process.env.SUPABASE_CORE_REPO_URL || 'https://github.com/supabase/supabase'
+    )
+    const configuredRef = await configuredCoreRef(coreDir, repoUrl)
+
     if (await isUsableSupabaseCore(coreDir)) {
-      return { success: true }
+      const info = await readSupabaseCoreInfo(coreDir)
+      const check = await checkCoreRef(coreDir, info, configuredRef, repoUrl)
+      if (check === 'match') {
+        return { success: true, ref: configuredRef, commit: info.commit }
+      }
+      const at = info.ref
+        ? `ref "${info.ref}"`
+        : info.commit
+          ? `commit ${info.commit.slice(0, 12)}`
+          : 'an unverifiable checkout'
+      const detail =
+        check === 'mismatch'
+          ? `supabase-core already exists at ${at} but SUPABASE_CORE_REF is "${configuredRef}"`
+          : `supabase-core already exists (${at}) and could not be verified against SUPABASE_CORE_REF "${configuredRef}"`
+      return {
+        success: false,
+        code: 'REF_MISMATCH',
+        error: `${detail}. Refusing to re-clone over an existing checkout: existing projects keep the files they were created from. To re-initialize at the configured ref, remove or rename the supabase-core directory and initialize again.`,
+      }
     }
 
     // An earlier attempt may have been interrupted part-way through, leaving a
@@ -204,24 +440,71 @@ export async function initializeSupabaseCore() {
       console.warn('Existing supabase-core directory is incomplete, re-cloning')
       await fs.rm(coreDir, { recursive: true, force: true })
     }
-    
-    const repoUrl = normalizeRepoUrl(
-      process.env.SUPABASE_CORE_REPO_URL || 'https://github.com/supabase/supabase'
-    )
 
     // Clone to a staging directory and move it into place only once complete, so
     // an interrupted clone can never leave a half-populated supabase-core.
     await fs.rm(stagingDir, { recursive: true, force: true })
-    console.log(`Cloning Supabase core from ${repoUrl}...`)
-    await execAsync(`git clone --depth 1 ${repoUrl} .supabase-core-incoming`, { timeout: 1800000 })
-    
+    console.log(`Cloning Supabase core at ${configuredRef} from ${repoUrl}...`)
+    if (isCommitSha(configuredRef)) {
+      // A commit SHA is not a ref `git clone --branch` can take, so fetch just
+      // that commit into a fresh repository instead. Commit refs are accepted
+      // only as full 40-character SHAs (normalizeCoreRef rejects abbreviated
+      // SHAs), which `git fetch` can resolve directly.
+      await fs.mkdir(stagingDir, { recursive: true })
+      await execFileAsync('git', ['init'], { cwd: stagingDir, timeout: 60000 })
+      await execFileAsync('git', ['remote', 'add', 'origin', repoUrl], { cwd: stagingDir, timeout: 60000 })
+      await execFileAsync('git', ['fetch', '--depth', '1', 'origin', configuredRef], {
+        cwd: stagingDir,
+        timeout: 1800000,
+        maxBuffer: 10 * 1024 * 1024,
+      })
+      await execFileAsync('git', ['checkout', '--detach', 'FETCH_HEAD'], {
+        cwd: stagingDir,
+        timeout: 60000,
+      })
+    } else {
+      // Shallow clone of the tag or branch; a shallow clone of a tag is enough
+      // because projects only copy the docker/ directory out of it.
+      await execFileAsync(
+        'git',
+        ['clone', '--depth', '1', '--branch', configuredRef, repoUrl, stagingDir],
+        { timeout: 1800000, maxBuffer: 10 * 1024 * 1024 }
+      )
+    }
+
     if (!(await isUsableSupabaseCore(stagingDir))) {
       throw new Error('Clone finished but docker/docker-compose.yml is missing from the Supabase repository')
     }
-    
+
+    // Validate the clone: it must resolve to a commit, and a SHA-configured ref
+    // must be the commit that was fetched. FETCH_HEAD is also accepted because
+    // an annotated tag's object SHA fetches fine and peels to its commit.
+    const commit = await git(['rev-parse', 'HEAD'], stagingDir)
+    const fetchedRev = await git(['rev-parse', 'FETCH_HEAD'], stagingDir)
+    if (!commit) {
+      throw new Error('Clone finished but the checked-out commit could not be resolved')
+    }
+    if (
+      isCommitSha(configuredRef) &&
+      commit.toLowerCase() !== configuredRef.toLowerCase() &&
+      (fetchedRev ?? '').toLowerCase() !== configuredRef.toLowerCase()
+    ) {
+      throw new Error(
+        `Clone of ${configuredRef} resolved to commit ${commit}, which does not match the requested ref`
+      )
+    }
+
+    // Record the resolved ref and commit so later Initialize calls can detect a
+    // changed SUPABASE_CORE_REF without re-cloning.
+    await fs.writeFile(
+      path.join(stagingDir, CORE_META_FILE),
+      JSON.stringify({ ref: configuredRef, commit, repoUrl, clonedAt: new Date().toISOString() }, null, 2) + '\n',
+      'utf8'
+    )
+
     await fs.rename(stagingDir, coreDir)
-    
-    return { success: true }
+
+    return { success: true, ref: configuredRef, commit }
   } catch (error) {
     await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined)
     console.error('Failed to initialize Supabase core:', error)
@@ -234,7 +517,15 @@ export async function createProject(name: string, userId: string, description?: 
     // Generate unique slug
     const timestamp = Date.now()
     const slug = `${name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${timestamp}`
-    
+
+    // Record which Supabase release this project's docker files come from. The
+    // ref is recorded only when the checkout verifies against it (meta at its
+    // own commit, or an unambiguous git ref); a legacy or detached checkout
+    // records the commit alone and shows as "unknown". The commit is always
+    // the live checkout the files were copied from. Rows from before this was
+    // tracked simply stay null.
+    const coreInfo = await readSupabaseCoreInfo(path.join(process.cwd(), 'supabase-core'))
+
     // Create project in database
     const project = await prisma.project.create({
       data: {
@@ -242,6 +533,8 @@ export async function createProject(name: string, userId: string, description?: 
         slug,
         description,
         ownerId: userId,
+        supabaseRef: coreInfo.ref,
+        supabaseCommit: coreInfo.commit,
       },
     })
     
