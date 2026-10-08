@@ -979,7 +979,12 @@ export async function deleteProject(projectId: string) {
 // resolved projects root before the helper is invoked.
 const PROJECTS_ROOT_NAME = 'supabase-projects'
 const CLEANUP_IMAGE = 'alpine:3.20'
-const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/
+// Slugs come from `createProject`, which lower-cases the slug and replaces
+// non-[a-z0-9-] with `-`. The result can legitimately start with `-` (e.g.
+// a project named `_demo` becomes `-demo`, or one named `日本語` becomes
+// only `-`s); `path.basename` always returns at least one char so a leading
+// `-` is the only edge case. Empty, `.`, and `..` are rejected explicitly.
+const SLUG_RE = /^[a-z0-9-]+$/
 
 async function removeProjectDirViaDocker(projectDir: string): Promise<void> {
   const cwd = process.cwd()
@@ -987,8 +992,8 @@ async function removeProjectDirViaDocker(projectDir: string): Promise<void> {
   const resolved = path.resolve(projectDir)
   const slug = path.basename(resolved)
 
-  if (!SLUG_RE.test(slug)) {
-    throw new Error(`Refusing to clean up project directory: slug "${slug}" does not match ${SLUG_RE}`)
+  if (slug === '' || slug === '.' || slug === '..' || !SLUG_RE.test(slug)) {
+    throw new Error(`Refusing to clean up project directory: slug "${slug}" is not a valid slug`)
   }
   if (path.dirname(resolved) !== projectsRoot) {
     throw new Error(
@@ -1005,7 +1010,9 @@ async function removeProjectDirViaDocker(projectDir: string): Promise<void> {
   }
 
   // Mount only the projects root, not cwd, and use execFile (not a shell
-  // string) so the slug cannot break out of the mount.
+  // string) so the slug cannot break out of the mount. The `--` ends rm's
+  // option parsing so a slug that happens to look like a flag (e.g. `-r`)
+  // is treated as a path.
   await execFileAsync(
     'docker',
     [

@@ -16,10 +16,13 @@ Both scripts come from the preview host (`supaconsole-preview`, root@157.230.168
 
 `vps-setup.sh` provisions two non-root accounts. The build is reproducible: on a fresh droplet the script creates both, sets their docker membership, and chowns the relevant directories.
 
-| User | uid | Role | Why |
-| --- | --- | --- | --- |
-| `supaconsole` | 997 (system) | Runs the `supaconsole` systemd unit. Member of `docker`; no login shell; no sudo. Owns `/opt/supaconsole`. | The Next.js process drives docker via the unix socket and writes under `/opt/supaconsole` (`supabase-projects/`, `prisma/supaconsole.db`, `supabase-core/`). Group `docker` is sufficient for the socket access; ownership of `/opt/supaconsole` covers the rest. |
-| `dev` | 1000 | Owner of the Traycer host service. Member of `docker`, `users`; linger enabled; npm prefix `~/.npm-global`. | The non-root account that owns agents and dev work. SSH alias `supaconsole-preview-dev` lands here; the Traycer host runs as `ai.traycer.host.service` under `dev`. |
+| User | Role | Why |
+| --- | --- | --- |
+| `supaconsole` | System user. Member of `docker`; no login shell; no sudo. Owns `/opt/supaconsole`. | The Next.js process drives docker via the unix socket and writes under `/opt/supaconsole` (`supabase-projects/`, `prisma/supaconsole.db`, `supabase-core/`). Group `docker` is sufficient for the socket access; ownership of `/opt/supaconsole` covers the rest. |
+| `dev` | Regular user. Member of `docker`, `users`; linger enabled; npm prefix `~/.npm-global`. | The non-root account that owns agents and dev work. SSH alias `supaconsole-preview-dev` lands here; the Traycer host runs as `ai.traycer.host.service` under `dev`. |
+
+UIDs are assigned by `useradd`/`adduser` and are not pinned in the script. Look at
+`id <user>` on a live host for the current values.
 
 The script does **not** install Traycer, Claude Code, or Codex for `dev`. Those are owner-only steps (they require interactive sign-in); see [Owner-only steps](#owner-only-steps).
 
@@ -35,9 +38,10 @@ scp ops/vps-setup.sh root@<host>:/root/vps-setup.sh
 ssh root@<host> 'BRANCH=main bash /root/vps-setup.sh'
 ```
 
-`vps-setup.sh` is idempotent in effect (it wipes `/opt/supaconsole` before cloning) but
-not in state: it will reset the DOCKER-USER unit and the `supaconsole` systemd service
-on every run. To pin a different SupaConsole branch on a rebuild, set `BRANCH`:
+`vps-setup.sh` is idempotent in effect (it clears the build outputs and clones from
+`BRANCH`) but not in state: it will reset the DOCKER-USER unit and the `supaconsole`
+systemd service on every run. To pin a different SupaConsole branch on a rebuild, set
+`BRANCH`:
 
 ```sh
 ssh root@<host> 'BRANCH=fix/supabase-2026-compat bash /root/vps-setup.sh'
@@ -48,11 +52,14 @@ rule, Supabase's compose file publishes the gateway and pooler on `0.0.0.0`, so 
 firewall unit is required for any public-internet host. On a private-only host you can
 skip the unit, but the script does not currently branch on that — change it if needed.
 
-The DOCKER-USER script deletes and re-inserts its `RETURN` and `DROP` rules on every
-run, so a stale RETURN left lower than the DROP (which would shadow replies to
-container-initiated traffic) cannot survive a `vps-setup.sh` invocation. The setup
-script's readiness probe accepts HTTP 200 from `http://127.0.0.1:3000/` and fails the
-build with the last response code and journal tail otherwise.
+The DOCKER-USER script uses a guard-first swap: a temporary comment-tagged DROP is
+inserted at position 1, the existing RETURN/DROP pair is removed, the new RETURN and
+DROP are inserted at the head, and the guard is removed by its comment. The WAN
+interface is never without a DROP during the swap, and rules unrelated to this
+script (e.g. agent-managed `-i lo -j ACCEPT`, comment-marked `RETURN`s) survive
+untouched. The setup script's readiness probe accepts HTTP 200 from
+`http://127.0.0.1:3000/` and fails the build with the last response code and journal
+tail otherwise.
 
 ## Run the regression script
 
@@ -86,14 +93,21 @@ Expected:
 
 The `verify` step requires `ALLOW_REGISTRATION=true` in the unit's environment so
 the second-user authorization check can register a fresh user. The shipped
-`vps-setup.sh` leaves it unset (bootstrap mode is the safe default). Enable it
-for an `e2e.sh` run, then unset it after:
+`vps-setup.sh` leaves it unset (bootstrap mode is the safe default). Operators
+enable it for an `e2e.sh verify` run via a systemd drop-in (creating the drop-in
+adds the variable, removing it takes it back to bootstrap), and reload between
+changes:
 
 ```sh
-ssh root@<host> 'sed -i "s/^# Environment=ALLOW_REGISTRATION=true$/Environment=ALLOW_REGISTRATION=true/" /etc/systemd/system/supaconsole.service && systemctl daemon-reload && systemctl restart supaconsole'
+# Enable open registration for the e2e window:
+ssh root@<host> 'mkdir -p /etc/systemd/system/supaconsole.service.d && echo "Environment=ALLOW_REGISTRATION=true" > /etc/systemd/system/supaconsole.service.d/allow-registration.conf && systemctl daemon-reload && systemctl restart supaconsole'
 # ...run ops/e2e.sh setup / deploy / verify / delete ...
-ssh root@<host> 'sed -i "/^Environment=ALLOW_REGISTRATION=true$/d" /etc/systemd/system/supaconsole.service && systemctl daemon-reload && systemctl restart supaconsole'
+# Disable:
+ssh root@<host> 'rm -f /etc/systemd/system/supaconsole.service.d/allow-registration.conf && systemctl daemon-reload && systemctl restart supaconsole'
 ```
+
+The drop-in survives `vps-setup.sh` re-runs: the script removes it during the
+service-user step so a fresh install always starts in bootstrap mode.
 
 ### Expected gateway table (what `verify` checks)
 
@@ -145,8 +159,17 @@ agents. They require interactive sign-in and are run once on a fresh host as
 # npm prefix + PATH
 mkdir -p ~/.npm-global
 npm config set prefix '~/.npm-global'
-grep -q '.npm-global/bin' ~/.profile || printf '\nexport PATH="$HOME/.npm-global/bin:$PATH"\n' >> ~/.profile
-grep -q '.npm-global/bin' ~/.bashrc || { tmp=$(mktemp); printf 'export PATH="$HOME/.npm-global/bin:$PATH"\n'; cat ~/.bashrc; } > "$tmp" && mv "$tmp" ~/.bashrc
+if ! grep -q '.npm-global/bin' ~/.profile; then
+  printf '\nexport PATH="$HOME/.npm-global/bin:$PATH"\n' >> ~/.profile
+fi
+if ! grep -q '.npm-global/bin' ~/.bashrc; then
+  tmp=$(mktemp)
+  {
+    printf 'export PATH="$HOME/.npm-global/bin:$PATH"\n'
+    cat ~/.bashrc
+  } > "$tmp"
+  mv "$tmp" ~/.bashrc
+fi
 loginctl enable-linger dev
 
 # Traycer CLI
@@ -221,6 +244,8 @@ for everyone. The rules below keep that baseline intact.
 - **Restore `main` and release the lock when done.** When you finish a deploy
   or test on the live host, leave `/opt/supaconsole` checked out at
   `origin/main` (`git checkout -B main origin/main` after fetching), remove any
-  leftover docker containers / volumes / networks from your project, and delete
-  `/root/droplet-lock/owner`. The host should look like a clean main build to
+  leftover docker containers / volumes / networks from your project, and release
+  the lock with `rm -f /root/droplet-lock/owner && rmdir /root/droplet-lock` so
+  the directory itself is gone (the next agent's `mkdir` only succeeds when the
+  directory does not already). The host should look like a clean main build to
   the next agent.
