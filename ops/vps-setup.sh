@@ -154,17 +154,28 @@ if [ -f "${DEV_HOME}/.bashrc" ] && ! grep -Fq '.npm-global/bin' "${DEV_HOME}/.ba
 fi
 chown -R "${DEV_USER}:${DEV_USER}" "${DEV_HOME}"
 
-step "supaconsole: clone ${BRANCH} (running as root)"
+step "supaconsole: prepare ${APP_DIR} for the build"
 # Stop any running service so the clone/build below is not racing with a
 # live process holding open files in the tree (especially .next/).
 if systemctl is-active --quiet supaconsole 2>/dev/null; then
   systemctl stop supaconsole
 fi
 mkdir -p "${APP_DIR}"
+# A writable HOME for the build. ${SVC_USER} has no login shell and no home
+# dir (--no-create-home), so npm/prisma need HOME pointed at a path they own.
+SVC_HOME=/var/lib/supaconsole
+install -d -o "${SVC_USER}" -g "${SVC_USER}" -m 0755 "${SVC_HOME}"
+# Hand the tree to root before any git operations, so a previous run that
+# left it owned by ${SVC_USER} does not produce "dubious ownership" errors
+# on re-run. (Codex finding #2's re-run case.) The handoff back to
+# ${SVC_USER} happens after the build.
+chown -R root:root "${APP_DIR}"
 # Remove the things a build produces so a rebuild from a clean slate is
 # deterministic; keep .git so a re-run can fast-forward instead of cloning
 # from scratch.
 rm -rf "${APP_DIR}/supabase-projects" "${APP_DIR}/supabase-core" "${APP_DIR}/.supabase-core-incoming"
+
+step "supaconsole: clone ${BRANCH} (running as root)"
 if [ ! -d "${APP_DIR}/.git" ]; then
   git clone -q --branch "${BRANCH}" https://github.com/KHAEntertainment/SupaConsole.git "${APP_DIR}"
 fi
@@ -173,12 +184,18 @@ git fetch -q origin "${BRANCH}"
 git checkout -q -B "${BRANCH}" "origin/${BRANCH}"
 git log --oneline -1
 
-step "supaconsole: install, prisma, build (running as root)"
-# Root can write /opt/supaconsole here because the chown to ${SVC_USER} has
-# not happened yet. The ownership transfer happens after the build is done.
-npm ci --no-audit --no-fund --loglevel=error
-DATABASE_URL="${DB_URL}" npx prisma generate >/dev/null
-DATABASE_URL="${DB_URL}" NODE_ENV=production npm run build 2>&1 | tail -15
+step "supaconsole: install, prisma, build (running as ${SVC_USER})"
+# Build as the service user so node_modules, .next, and the Prisma client all
+# land owned by ${SVC_USER} from the start. ROOT_HOME so npm's user-global
+# cache writes to /root/.npm only if root were running; here HOME points at
+# ${SVC_HOME} so writes go there. No global git safe.directory is needed
+# because we chowned to root above and are using HOME=${SVC_HOME}.
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && npm ci --no-audit --no-fund --loglevel=error"
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' npx prisma generate" >/dev/null
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' NODE_ENV=production npm run build" 2>&1 | tail -15
 
 step "supaconsole: transfer ownership to ${SVC_USER}"
 chown -R "${SVC_USER}:${SVC_USER}" "${APP_DIR}"
