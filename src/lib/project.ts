@@ -56,7 +56,7 @@ function generateJWT(role: 'anon' | 'service_role', secret: string, timestamp: n
 // Reads KEY=value pairs out of the upstream .env.example that ships inside
 // supabase-core/docker. Using this as the source of truth means new Supabase
 // releases are picked up automatically instead of requiring code changes.
-function parseEnvExample(content: string): Map<string, string> {
+export function parseEnvExample(content: string): Map<string, string> {
   const vars = new Map<string, string>()
   for (const rawLine of content.split('\n')) {
     const line = rawLine.trim().replace(/^#\s?/, '')

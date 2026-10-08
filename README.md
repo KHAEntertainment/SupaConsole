@@ -89,8 +89,8 @@
 
 4. **Set up the database**
    ```bash
-   npm run db:push
    npm run db:generate
+   npm run db:migrate
    ```
 
 5. **Start the development server**
@@ -173,13 +173,15 @@ npm run start           # Start production server
 
 # Database
 npm run db:generate     # Generate Prisma client
-npm run db:push         # Push schema changes to database
+npm run db:migrate      # Apply tracked migrations (baselines legacy db-push DBs)
+npm run db:push         # Push schema changes to database (dev shortcut)
 npm run db:studio       # Open Prisma Studio
 npm run db:reset        # Reset database (⚠️ destructive)
 
 # Code Quality
 npm run lint            # Run ESLint
 npm run type-check      # TypeScript type checking
+npm test                # Run unit tests (Vitest)
 ```
 
 ### Environment Variables

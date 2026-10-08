@@ -88,7 +88,7 @@ git log --oneline -1
 step "supaconsole: install, prisma, build"
 npm ci --no-audit --no-fund --loglevel=error
 DATABASE_URL="$DB_URL" npx prisma generate >/dev/null
-DATABASE_URL="$DB_URL" npx prisma db push --skip-generate
+DATABASE_URL="$DB_URL" node scripts/db-migrate.mjs
 DATABASE_URL="$DB_URL" NODE_ENV=production npm run build 2>&1 | tail -15
 
 step "supaconsole: systemd service on 127.0.0.1:3000"
