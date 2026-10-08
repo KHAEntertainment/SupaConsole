@@ -514,9 +514,19 @@ export async function initializeSupabaseCore(): Promise<
 
 export async function createProject(name: string, userId: string, description?: string) {
   try {
-    // Generate unique slug
+    // Generate unique slug. Replace non-[a-z0-9] runs with a single '-', then
+    // strip leading and trailing dashes so the result is always safe to use as
+    // a Docker container/compose name (which must start with an alphanumeric
+    // character). Two names that collapse to the same base (e.g. 'demo' and
+    // '_demo') will collide; the timestamp plus the DB unique constraint on
+    // slug means a same-ms collision now fails the create instead of merging
+    // stacks. Empty bases fall back to 'project'.
     const timestamp = Date.now()
-    const slug = `${name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${timestamp}`
+    const baseSlug = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+    const slug = `${baseSlug || 'project'}-${timestamp}`
 
     // Record which Supabase release this project's docker files come from. The
     // ref is recorded only when the checkout verifies against it (meta at its
@@ -566,6 +576,9 @@ export async function createProject(name: string, userId: string, description?: 
       const suffix = containerName
         .replace(/^supabase-/, '')
         .replace(/^realtime-dev\./, '')
+      // The slug generator strips leading and trailing dashes, so the slug is
+      // already a valid Docker container name (alphanumeric first character).
+      // No further sanitization is needed here.
       const replacement = containerName.startsWith('realtime-dev.')
         ? `realtime-dev.${slug}-${suffix}`
         : `${slug}-${suffix}`
@@ -896,18 +909,18 @@ export async function deleteProject(projectId: string) {
     const project = await prisma.project.findUnique({
       where: { id: projectId },
     })
-    
+
     if (!project) {
       throw new Error('Project not found')
     }
-    
+
     const projectDir = path.join(process.cwd(), 'supabase-projects', project.slug)
     const dockerDir = path.join(projectDir, 'docker')
-    
+
     // Step 1: Stop and remove Docker containers
     try {
       console.log(`Stopping Docker containers for project ${project.slug}...`)
-      await execAsync('docker compose down --volumes --remove-orphans', { 
+      await execAsync('docker compose down --volumes --remove-orphans', {
         cwd: dockerDir,
         timeout: 120000, // 2 minutes timeout
         maxBuffer: 1024 * 1024 * 5 // 5MB buffer
@@ -916,28 +929,43 @@ export async function deleteProject(projectId: string) {
       console.warn('Failed to stop Docker containers (they may not be running):', dockerError)
       // Continue with deletion even if Docker cleanup fails
     }
-    
-    // Step 2: Remove project directory
+
+    // Step 2: Remove project directory. The plain rm path still works on hosts
+    // where the service runs as root, and is the simplest cleanup on macOS or
+    // on hosts without bind-mounts. On Linux hosts running this app as a
+    // non-root service user, the docker bind-mount target dirs (e.g.
+    // supabase-projects/<slug>/docker/volumes/db/data) end up owned by the
+    // container's internal UID (often a system account like dhcpcd), so the
+    // service user can't remove them directly. In that case we fall back to a
+    // throwaway container running as root, which has the access to the bind-
+    // mount source dirs that the service user lacks.
     try {
       console.log(`Removing project directory: ${projectDir}`)
       const isWindows = process.platform === 'win32'
-      const removeCommand = isWindows 
-        ? `rmdir /s /q "${projectDir}"` 
-        : `rm -rf "${projectDir}"`
-      
-      await execAsync(removeCommand, { timeout: 60000 })
+      if (isWindows) {
+        await execAsync(`rmdir /s /q "${projectDir}"`, { timeout: 60000 })
+      } else {
+        await execFileAsync('rm', ['-rf', '--', projectDir], { timeout: 60000 })
+      }
     } catch (fsError) {
-      console.warn('Failed to remove project directory:', fsError)
-      // Continue with database cleanup even if filesystem cleanup fails
+      if (process.platform !== 'win32') {
+        const stillExists = await fs.access(projectDir).then(() => true).catch(() => false)
+        if (stillExists) {
+          console.warn(`Plain rm failed for ${projectDir}; falling back to docker helper for bind-mount cleanup`)
+          await removeProjectDirViaDocker(projectDir)
+        }
+      } else {
+        console.warn('Failed to remove project directory:', fsError)
+      }
     }
-    
+
     // Step 3: Clean up database records
     try {
       // Delete project environment variables
       await prisma.projectEnvVar.deleteMany({
         where: { projectId },
       })
-      
+
       // Delete the project itself
       await prisma.project.delete({
         where: { id: projectId },
@@ -946,11 +974,71 @@ export async function deleteProject(projectId: string) {
       console.error('Failed to clean up database records:', dbError)
       throw new Error('Failed to remove project from database')
     }
-    
+
     console.log(`Project ${project.slug} deleted successfully`)
     return { success: true }
   } catch (error) {
     console.error('Failed to delete project:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+// Remove a project directory using a one-shot root-in-a-container helper.
+// Used when the service user can't delete docker bind-mount source dirs
+// directly (see the comment in deleteProject). Mounts the projects root
+// (resolved relative to cwd), not the entire SupaConsole tree, so a stray
+// path can't reach prisma/supaconsole.db or supabase-core. The slug is
+// validated against a strict regex and a containment check against the
+// resolved projects root before the helper is invoked.
+const PROJECTS_ROOT_NAME = 'supabase-projects'
+const CLEANUP_IMAGE = 'alpine:3.20'
+// Slugs come from `createProject`, which lower-cases the name, replaces runs
+// of non-[a-z0-9] with '-', and strips leading and trailing dashes. Legacy
+// slugs in the database may still start with '-' (predating that change);
+// the regex keeps accepting them so cleanup stays correct for old data.
+// Empty, '.', and '..' are rejected explicitly.
+const SLUG_RE = /^[a-z0-9-]+$/
+
+async function removeProjectDirViaDocker(projectDir: string): Promise<void> {
+  const cwd = process.cwd()
+  const projectsRoot = path.resolve(cwd, PROJECTS_ROOT_NAME)
+  const resolved = path.resolve(projectDir)
+  const slug = path.basename(resolved)
+
+  if (slug === '' || slug === '.' || slug === '..' || !SLUG_RE.test(slug)) {
+    throw new Error(`Refusing to clean up project directory: slug "${slug}" is not a valid slug`)
+  }
+  if (path.dirname(resolved) !== projectsRoot) {
+    throw new Error(
+      `Refusing to clean up project directory: ${resolved} is not a direct child of ${projectsRoot}`
+    )
+  }
+
+  // Best-effort pull of a pinned image; ignore failure so the helper can
+  // still run if the registry is unreachable and the image is already local.
+  try {
+    await execFileAsync('docker', ['pull', '--quiet', CLEANUP_IMAGE], { timeout: 120000 })
+  } catch (pullError) {
+    console.warn(`docker pull ${CLEANUP_IMAGE} failed (continuing if image is local):`, pullError)
+  }
+
+  // Mount only the projects root, not cwd, and use execFile (not a shell
+  // string) so the slug cannot break out of the mount. The `--` ends rm's
+  // option parsing so a slug that happens to look like a flag (e.g. `-r`)
+  // is treated as a path.
+  await execFileAsync(
+    'docker',
+    [
+      'run', '--rm',
+      '-v', `${projectsRoot}:/projects`,
+      CLEANUP_IMAGE,
+      'rm', '-rf', '--', `/projects/${slug}`,
+    ],
+    { timeout: 120000 }
+  )
+
+  const stillExists = await fs.access(resolved).then(() => true).catch(() => false)
+  if (stillExists) {
+    throw new Error(`Docker helper ran but ${resolved} still exists`)
   }
 }

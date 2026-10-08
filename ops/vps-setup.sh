@@ -6,6 +6,9 @@ export DEBIAN_FRONTEND=noninteractive
 APP_DIR=/opt/supaconsole
 BRANCH="${BRANCH:-main}"
 DB_URL="file:${APP_DIR}/prisma/supaconsole.db"
+SVC_USER=supaconsole
+DEV_USER=dev
+DOCKER_USER_LOCKDOWN=/usr/local/sbin/docker-user-lockdown.sh
 
 step() { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 
@@ -45,15 +48,46 @@ step "docker-user lockdown: block internet access to Docker-published ports"
 # interface in DOCKER-USER; replies to container-initiated traffic stay allowed.
 WAN_IF=$(ip route show default | awk '{print $5; exit}')
 [ -n "$WAN_IF" ] || { echo "no default route interface"; exit 1; }
-cat > /usr/local/sbin/docker-user-lockdown.sh <<SCRIPT
+# Every `\$` below is the heredoc escape for a literal `$` in the embedded
+# script — those are runtime substitutions inside the lockdown script, not
+# expansions at heredoc-write time. (Escape `$ipt` too: it is not set in this
+# shell under `set -u`, so an unescaped reference would abort setup.)
+cat > "${DOCKER_USER_LOCKDOWN}" <<SCRIPT
 #!/bin/sh
+# Fail fast on any iptables error. set -u catches typos; set -e exits on the
+# first non-zero iptables call so a half-applied swap cannot leave the WAN
+# interface without a DROP. CHAIN is parameterised so the test stub can
+# redirect to a scratch chain.
+set -eu
+WAN_IF=\$(ip route show default | awk '{print \$5; exit}')
+[ -n "\$WAN_IF" ] || exit 1
+GUARD_COMMENT=docker-user-lockdown-guard
+CHAIN="\${CHAIN:-DOCKER-USER}"
 for ipt in iptables ip6tables; do
-  \$ipt -n -L DOCKER-USER >/dev/null 2>&1 || continue
-  \$ipt -C DOCKER-USER -i ${WAN_IF} -j DROP 2>/dev/null || \$ipt -I DOCKER-USER -i ${WAN_IF} -j DROP
-  \$ipt -C DOCKER-USER -i ${WAN_IF} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null || \$ipt -I DOCKER-USER -i ${WAN_IF} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  \$ipt -w -n -L "\$CHAIN" >/dev/null 2>&1 || continue
+  # Guard-first swap. Insert the comment-tagged guard at position 1; any
+  # failure here aborts before any deletion, so the chain is unchanged. -w
+  # takes the xtables lock exclusively so a concurrent iptables caller
+  # can't observe a torn state.
+  \$ipt -w -I "\$CHAIN" 1 -i "\$WAN_IF" -j DROP -m comment --comment "\$GUARD_COMMENT"
+  # Remove the existing RETURN/DROP pair. The guard is tagged, so it is
+  # invisible to these deletion patterns; the while loops are bounded by
+  # the loop's exit when the deletion finds nothing to remove.
+  while \$ipt -w -D "\$CHAIN" -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null; do :; done
+  while \$ipt -w -D "\$CHAIN" -i "\$WAN_IF" -j DROP 2>/dev/null; do :; done
+  # Insert the permanent RETURN/DROP. set -e fails the script if either
+  # insert fails, so the guard is preserved and the chain keeps a DROP.
+  \$ipt -w -I "\$CHAIN" 1 -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  \$ipt -w -I "\$CHAIN" 2 -i "\$WAN_IF" -j DROP
+  # Verify both permanent rules are present before removing the guard. If
+  # either is missing, set -e exits and the guard stays put.
+  \$ipt -w -C "\$CHAIN" -i "\$WAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  \$ipt -w -C "\$CHAIN" -i "\$WAN_IF" -j DROP
+  # Safe to remove the guard now.
+  while \$ipt -w -D "\$CHAIN" -i "\$WAN_IF" -j DROP -m comment --comment "\$GUARD_COMMENT" 2>/dev/null; do :; done
 done
 SCRIPT
-chmod 755 /usr/local/sbin/docker-user-lockdown.sh
+chmod 755 "${DOCKER_USER_LOCKDOWN}"
 cat > /etc/systemd/system/docker-user-lockdown.service <<'UNIT'
 [Unit]
 Description=Block internet access to Docker-published ports
@@ -69,7 +103,10 @@ RemainAfterExit=yes
 WantedBy=docker.service
 UNIT
 systemctl daemon-reload
-systemctl enable --now docker-user-lockdown >/dev/null 2>&1
+systemctl enable docker-user-lockdown >/dev/null 2>&1 || true
+# Re-runs must pick up the rewritten ExecStart even if the unit was already
+# active from a previous run. `enable --now` skips restart; do it explicitly.
+systemctl restart docker-user-lockdown
 # Fail the setup if the rules didn't land: a silent miss leaves Postgres public.
 iptables -C DOCKER-USER -i "$WAN_IF" -j DROP
 iptables -S DOCKER-USER
@@ -79,19 +116,110 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null
 apt-get install -y -qq nodejs >/dev/null
 node --version; npm --version
 
-step "supaconsole: clone ${BRANCH}"
-rm -rf "$APP_DIR"
-git clone -q --branch "$BRANCH" https://github.com/KHAEntertainment/SupaConsole.git "$APP_DIR"
-cd "$APP_DIR"
-git log --oneline -1
+step "service user: ${SVC_USER} (docker group, no shell, no sudo)"
+# A system user with no login shell, in the docker group so the Next process
+# can drive docker via the unix socket. /opt/supaconsole is owned by this
+# user so the service can write prisma/supaconsole.db, the project tree, and
+# clone supabase-core without a system-wide privileged path.
+if ! id -u "${SVC_USER}" >/dev/null 2>&1; then
+  useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "${SVC_USER}"
+fi
+# Membership in docker is what gives docker access; the primary group is set
+# for clear ownership of files created by the service.
+usermod -aG docker "${SVC_USER}"
 
-step "supaconsole: install, prisma, build"
-npm ci --no-audit --no-fund --loglevel=error
-DATABASE_URL="$DB_URL" npx prisma generate >/dev/null
-DATABASE_URL="$DB_URL" npx prisma db push --skip-generate
-DATABASE_URL="$DB_URL" NODE_ENV=production npm run build 2>&1 | tail -15
+step "dev user: ${DEV_USER} (docker group, users group, linger on, npm prefix)"
+# The non-root user that owns Traycer agents and dev work. Same docker
+# membership as the service user; no sudo, since the only thing this account
+# is allowed to do on the host is run agents and develop.
+if ! id -u "${DEV_USER}" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash --user-group "${DEV_USER}"
+  passwd -l "${DEV_USER}" >/dev/null
+fi
+usermod -aG docker "${DEV_USER}"
+usermod -aG users "${DEV_USER}"
+# SSH access for agents: copy root's authorized_keys into ~dev/.ssh with
+# correct ownership and modes. Idempotent — overwrites with whatever root
+# currently trusts.
+DEV_HOME=$(getent passwd "${DEV_USER}" | cut -d: -f6)
+install -d -m 0700 -o "${DEV_USER}" -g "${DEV_USER}" "${DEV_HOME}/.ssh"
+if [ -s /root/.ssh/authorized_keys ]; then
+  install -m 0600 -o "${DEV_USER}" -g "${DEV_USER}" /root/.ssh/authorized_keys "${DEV_HOME}/.ssh/authorized_keys"
+fi
+# Linger so user services (e.g. the Traycer host) survive the dev user's
+# logout. `enable-linger` is idempotent.
+loginctl enable-linger "${DEV_USER}"
+# npm global prefix and PATH lines in ~/.profile and ~/.bashrc. Both files
+# are kept narrow: ~/.profile carries the PATH for login shells, ~/.bashrc
+# carries it for interactive shells (placed at the head, before the
+# non-interactive early-return).
+PROFILE_PATH_LINE='export PATH="$HOME/.npm-global/bin:$PATH"'
+BASHRC_PATH_LINE='export PATH="$HOME/.npm-global/bin:$PATH"'
+if ! grep -Fq '.npm-global/bin' "${DEV_HOME}/.profile" 2>/dev/null; then
+  printf '\n%s\n' "${PROFILE_PATH_LINE}" >> "${DEV_HOME}/.profile"
+fi
+if [ -f "${DEV_HOME}/.bashrc" ] && ! grep -Fq '.npm-global/bin' "${DEV_HOME}/.bashrc"; then
+  tmp=$(mktemp)
+  {
+    printf '%s\n' "${BASHRC_PATH_LINE}"
+    cat "${DEV_HOME}/.bashrc"
+  } > "${tmp}"
+  install -m 0644 -o "${DEV_USER}" -g "${DEV_USER}" "${tmp}" "${DEV_HOME}/.bashrc"
+  rm -f "${tmp}"
+fi
+chown -R "${DEV_USER}:${DEV_USER}" "${DEV_HOME}"
 
-step "supaconsole: systemd service on 127.0.0.1:3000"
+step "supaconsole: prepare ${APP_DIR} for the build"
+# Stop any running service so the build below is not racing with a live
+# process holding open files in the tree (especially .next/).
+if systemctl is-active --quiet supaconsole 2>/dev/null; then
+  systemctl stop supaconsole
+fi
+mkdir -p "${APP_DIR}"
+chown -R "${SVC_USER}:${SVC_USER}" "${APP_DIR}"
+# A writable HOME for git/npm/prisma. ${SVC_USER} has no login shell and no
+# home dir (--no-create-home), so the build env needs HOME pointed at a path
+# they own.
+SVC_HOME=/var/lib/supaconsole
+install -d -o "${SVC_USER}" -g "${SVC_USER}" -m 0755 "${SVC_HOME}"
+# Remove the things a build produces so a rebuild from a clean slate is
+# deterministic; keep .git so a re-run can fast-forward instead of cloning
+# from scratch.
+rm -rf "${APP_DIR}/supabase-projects" "${APP_DIR}/supabase-core" "${APP_DIR}/.supabase-core-incoming"
+
+step "supaconsole: clone ${BRANCH} (running as ${SVC_USER})"
+# All git operations run as ${SVC_USER}. Root must NEVER execute git in this
+# tree: a previous build can leave hooks the script itself can't see (planted
+# core.hooksPath, post-checkout hooks), and root executing them runs
+# service-controlled code with full privileges. Running as ${SVC_USER} limits
+# a hook hijack to what the service user can do anyway.
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" \
+  bash -c "set -eu
+    cd '${APP_DIR}'
+    if [ -d .git ]; then
+      git fetch -q origin '${BRANCH}'
+      git checkout -q -B '${BRANCH}' 'origin/${BRANCH}'
+    else
+      git clone -q --branch '${BRANCH}' https://github.com/KHAEntertainment/SupaConsole.git .
+    fi
+    git log --oneline -1"
+
+step "supaconsole: install, prisma, build (running as ${SVC_USER})"
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && npm ci --no-audit --no-fund --loglevel=error"
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' npx prisma generate" >/dev/null
+# db push: this script is for fresh installs, where prisma/supaconsole.db
+# does not yet have the schema. On an existing DB whose schema matches
+# schema.prisma, db push is a no-op. The script is not meant to be run
+# against a DB with extra columns outside the schema — that needs operator
+# judgement and is documented in ops/README.md under Shared host rules.
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' npx prisma db push --skip-generate" >/dev/null
+runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
+  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' NODE_ENV=production npm run build" 2>&1 | tail -15
+
+step "supaconsole: systemd service on 127.0.0.1:3000 (User=${SVC_USER})"
 cat > /etc/systemd/system/supaconsole.service <<UNIT
 [Unit]
 Description=SupaConsole
@@ -99,6 +227,8 @@ After=network-online.target docker.service
 Wants=network-online.target docker.service
 
 [Service]
+User=${SVC_USER}
+Group=${SVC_USER}
 WorkingDirectory=${APP_DIR}
 Environment=NODE_ENV=production
 Environment=DATABASE_URL=${DB_URL}
@@ -110,13 +240,29 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 UNIT
+# Drop any ALLOW_REGISTRATION override left from a previous run; the unit file
+# is the source of truth and starts in bootstrap mode.
+rm -f /etc/systemd/system/supaconsole.service.d/allow-registration.conf
 systemctl daemon-reload
-systemctl enable --now supaconsole >/dev/null 2>&1
+systemctl enable supaconsole >/dev/null 2>&1 || true
+# `enable --now` does not pick up a rewritten unit on a re-run, and the old
+# root-owned process from a previous setup must be replaced. Restart explicitly.
+systemctl restart supaconsole
+# Readiness loop: only HTTP 200 on the root probe counts as up. Anything
+# else (502, 503, ECONNREFUSED-as-000, etc.) is a setup failure.
+last_code=000
 for i in $(seq 1 30); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)
-  [ "$code" != "000" ] && break; sleep 2
+  last_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:3000/ || true)
+  if [ "${last_code}" = "200" ]; then break; fi
+  sleep 2
 done
-echo "supaconsole HTTP: $code"
+if [ "${last_code}" != "200" ]; then
+  echo "FATAL: SupaConsole did not respond with HTTP 200 on http://127.0.0.1:3000/ (last response: ${last_code})"
+  echo "--- service status ---"; systemctl --no-pager status supaconsole || true
+  echo "--- last 30 journal lines ---"; journalctl --no-pager -n 30 -u supaconsole || true
+  exit 1
+fi
+echo "supaconsole HTTP: ${last_code}"
 ss -ltnp | grep -E ':3000\b'
 
 step "DONE"
