@@ -8,6 +8,8 @@ Host setup and end-to-end regression for the SupaConsole test VPS.
 | --- | --- |
 | `vps-setup.sh` | One-shot Ubuntu 24.04 host setup. Installs Docker, configures the DOCKER-USER lockdown, installs Node 22, creates the `supaconsole` and `dev` users, clones SupaConsole, builds it, and starts it under systemd on `127.0.0.1:3000`. |
 | `e2e.sh` | End-to-end regression against a running SupaConsole. Drives `setup → deploy → verify → delete` over the project's own HTTP API. Used as a release gate for persistent projects. |
+| `realtime-check/` | Pinned realtime client (`@supabase/supabase-js`, `ws`) used by `e2e.sh verify` for the realtime round-trip. |
+| `test-e2e-log-gate.sh` | Unit test for `e2e.sh`'s gateway access-log key gate against a stubbed `docker logs` (unreadable log, empty log, clean, leaked keys). No Docker needed. |
 | `README.md` | This file. |
 
 Both scripts come from the preview host (`supaconsole-preview`, root@157.230.168.87) and have been adapted for the repo. `vps-setup.sh` makes the cloned SupaConsole branch a parameter (`BRANCH=…`, default `main`) instead of hardcoding `fix/supabase-2026-compat`; `e2e.sh` adds a non-zero-exit gate around `verify` and `delete` (see below).
@@ -70,6 +72,10 @@ the `supaconsole` systemd service is enabled. Drive the regression on the host:
 # from the host
 scp <laptop>:ops/e2e.sh /root/e2e.sh    # or copy the file however you prefer
 chmod +x /root/e2e.sh
+# verify's realtime check uses the pinned helper package in ops/realtime-check/.
+# A copied-alone e2e.sh finds it in the installed app ($E2E_APP_DIR/ops/realtime-check,
+# default /opt/supaconsole/ops/realtime-check); copy it next to the script, or set
+# E2E_REALTIME_DIR, to use another copy. verify runs `npm ci` there on first use.
 /root/e2e.sh setup
 /root/e2e.sh deploy
 /root/e2e.sh verify
@@ -87,6 +93,14 @@ Expected:
   status codes; any row that does not match, any unhealthy container, or a missing
   data-path row makes `verify` exit non-zero and print `RESULT: FAIL`. A clean run
   prints `RESULT: PASS` and exits 0.
+- `verify` also runs a realtime round-trip (subscribe with the anon key, insert with
+  the service key, INSERT event received through the gateway) with the pinned client
+  in `ops/realtime-check/` (`@supabase/supabase-js` and `ws`, exact versions, locked).
+  The client sends the apikey as a websocket handshake header, never in the URL, and
+  `verify` then checks that the gateway's access log contains neither key. Both count
+  toward the summary.
+- `E2E_BASE`, `E2E_WORKDIR`, `E2E_APP_DIR` and `E2E_REALTIME_DIR` point the script at
+  another instance; the defaults are the VPS layout above.
 - `delete` removes the project and counts what is left: containers, project
   directories, Docker volumes, and Docker networks, all filtered by the project's
   compose project name. Anything > 0 makes `delete` exit non-zero.
