@@ -683,7 +683,18 @@ export async function updateProjectEnvVars(projectId: string, envVars: Record<st
   }
 }
 
-export async function deployProject(projectId: string) {
+// How long deploy waits for the project to become healthy. A cold first boot
+// (fresh database init, realtime creating its slot) takes a few minutes.
+function healthTimeoutMs(): number {
+  const raw = Number(process.env.SUPACONSOLE_HEALTH_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : engine.DEFAULT_HEALTH_TIMEOUT_MS
+}
+
+export async function deployProject(projectId: string): Promise<{
+  success: boolean
+  error?: string
+  health?: engine.HealthResult
+}> {
   try {
     const project = await prisma.project.findUnique({
       where: { id: projectId },
@@ -751,22 +762,40 @@ export async function deployProject(projectId: string) {
       }
     }
     
-    // Verify that containers are running
+    // `up` returning only means compose created the containers. Wait (bounded)
+    // until the project actually serves clients: containers healthy, DB
+    // reachable through the pooler, gateway, auth, REST and a realtime
+    // round-trip, which also warms realtime for the first real subscriber.
+    const stored = await prisma.projectEnvVar.findMany({ where: { projectId } })
+    const env: Record<string, string> = {}
+    for (const row of stored) env[row.key] = row.value
+    console.log('Waiting for the project to become healthy...')
+    const health = await engine.health(target, env, {
+      timeoutMs: healthTimeoutMs(),
+      probeHost: process.env.SUPACONSOLE_PROBE_HOST,
+    })
     try {
-      const containers = await engine.ps(target)
-      const runningContainers = containers.filter((c) => c.State === 'running')
-      console.log(`Deployment successful: ${runningContainers.length} containers running`)
-    } catch {
-      console.warn('Could not verify container status, but deployment may have succeeded')
+      await engine.writeHealth(dockerDir, health)
+    } catch (writeError) {
+      console.warn('Could not record the health result:', writeError)
     }
-    
-    // Update project status
+    for (const check of health.checks) {
+      console.log(`  health ${check.ok ? 'PASS' : 'FAIL'} ${check.name} (${check.ms}ms, ${check.attempts} attempt(s)): ${check.detail}`)
+    }
+
     await prisma.project.update({
       where: { id: projectId },
-      data: { status: 'active' },
+      data: { status: health.healthy ? 'active' : 'unhealthy' },
     })
-    
-    return { success: true }
+
+    if (!health.healthy) {
+      return {
+        success: false,
+        error: `Deployment unhealthy after ${Math.round(health.ms / 1000)}s: ${engine.describeFailure(health)}`,
+        health,
+      }
+    }
+    return { success: true, health }
   } catch (error) {
     console.error('Failed to deploy project:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }

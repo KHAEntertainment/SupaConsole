@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { validateSession } from '@/lib/auth'
 import { createProject } from '@/lib/project'
+import { readHealth } from '@/lib/engine'
+import * as path from 'path'
 
 export async function GET(request: NextRequest) {
   try {
@@ -27,7 +29,21 @@ export async function GET(request: NextRequest) {
       orderBy: { createdAt: 'desc' },
     })
 
-    return NextResponse.json({ projects })
+    // The last deploy's health result, summarized (additive field; null when
+    // the project has never been health-checked).
+    const withHealth = await Promise.all(
+      projects.map(async (project) => {
+        const result = await readHealth(path.join(process.cwd(), 'supabase-projects', project.slug, 'docker'))
+        return {
+          ...project,
+          health: result
+            ? { healthy: result.healthy, checkedAt: result.checkedAt, failed: result.failed }
+            : null,
+        }
+      })
+    )
+
+    return NextResponse.json({ projects: withHealth })
   } catch (error) {
     console.error('Get projects error:', error)
     return NextResponse.json(

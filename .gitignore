@@ -43,3 +43,5 @@ next-env.d.ts
 /.supabase-core-incoming
 
 .env
+# ops realtime check dependencies (installed by ops/e2e.sh)
+/ops/realtime-check/node_modules

@@ -2,8 +2,19 @@
 # End-to-end check of SupaConsole on the test VPS. Usage: e2e.sh setup|deploy|verify|delete
 # Secrets (session cookie, generated project keys) stay in /root/e2e (mode 700) and are never printed.
 set -uo pipefail
-BASE=http://localhost:3000
-W=/root/e2e; mkdir -p "$W"; chmod 700 "$W"
+# E2E_BASE / E2E_WORKDIR / E2E_APP_DIR default to the test VPS layout; override
+# them to point the same checks at another instance.
+BASE=${E2E_BASE:-http://localhost:3000}
+W=${E2E_WORKDIR:-/root/e2e}; mkdir -p "$W"; chmod 700 "$W"
+APP=${E2E_APP_DIR:-/opt/supaconsole}
+# The realtime helper package: E2E_REALTIME_DIR, else a realtime-check/ next to
+# this script (running from a checkout), else the installed app's copy (this
+# script copied alone to /root, as ops/README.md describes).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -n "${E2E_REALTIME_DIR:-}" ]; then RT=$E2E_REALTIME_DIR
+elif [ -f "$SCRIPT_DIR/realtime-check/check.mjs" ]; then RT=$SCRIPT_DIR/realtime-check
+else RT=$APP/ops/realtime-check
+fi
 JAR="$W/cookies.txt"
 step() { echo; echo "=== [$(date +%H:%M:%S)] $* ==="; }
 api() { # api METHOD PATH [JSON] [MAXTIME] -> prints "HTTP <code> <body excerpt>"
@@ -15,6 +26,35 @@ code_of() { # code_of "HTTP <code> <body>" -> <code> (for check())
   local o=${1#HTTP }
   printf '%s' "${o%% *}"
 }
+# log_gate CONTAINER -> PASS/FAIL "gateway access log contains neither API key"
+# (Gate 1 finding D: Envoy's access log records request paths). The log is read
+# into a private file first so a failed read (e.g. a logging driver that can't
+# be read back) or an empty log fails the gate rather than passing as "no
+# matches"; only grep's no-match result passes. The keys reach grep through a
+# pipe, never argv; matching lines are counted, never printed, and the file
+# stays in the mode-700 workdir until it is removed.
+log_gate() {
+  local gwlog="$W/gateway.log" rc leaks lines
+  ( umask 077; : > "$gwlog" )
+  docker logs "$1" > "$gwlog" 2>&1; rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "  FAIL  gateway access log could not be read (docker logs exit $rc)"; fail=$((fail+1))
+  else
+    lines=$(wc -l < "$gwlog" | tr -d ' ')
+    leaks=$(grep -cFf <(printf '%s\n%s\n' "$ANON" "$SVC") "$gwlog"); rc=$?
+    if [ "$lines" = 0 ]; then
+      echo "  FAIL  gateway access log is empty (nothing to check)"; fail=$((fail+1))
+    elif [ "$rc" = 1 ]; then
+      echo "  PASS  gateway access log contains neither API key ($lines lines read)"; pass=$((pass+1))
+    elif [ "$rc" = 0 ]; then
+      echo "  FAIL  gateway access log contains an API key on $leaks line(s)"; fail=$((fail+1))
+    else
+      echo "  FAIL  gateway access log could not be searched (grep exit $rc)"; fail=$((fail+1))
+    fi
+  fi
+  rm -f "$gwlog"
+}
+
 project_id() { jq -r .project.id "$W/project.json"; }
 project_slug() { jq -r .project.slug "$W/project.json"; }
 
@@ -25,7 +65,7 @@ setup)
   api POST /api/auth/login '{"email":"e2e@example.com","password":"e2e-Test-pass-1"}'
   step "initialize (clone supabase core)"
   s=$SECONDS; api POST /api/projects/initialize '' 1800; echo "took $((SECONDS-s))s"
-  git -C /opt/supaconsole/supabase-core log --oneline -1 2>&1 | head -1
+  git -C "$APP/supabase-core" log --oneline -1 2>&1 | head -1
   step "create project"
   curl -s -m 300 -b "$JAR" -X POST -H 'Content-Type: application/json' -d '{"name":"compat-e2e"}' "$BASE/api/projects" > "$W/project.json"
   jq '{id: .project.id, slug: .project.slug, error: .error}' "$W/project.json"
@@ -108,6 +148,42 @@ verify)
     echo "  FAIL  data path did not return the seeded row"; fail=$((fail+1))
   fi
 
+  step "realtime: subscribe (anon) + insert (service key) -> event"
+  # Gate 1 finding A: realtime through the gateway broke unnoticed because this
+  # gate never exercised it. Pinned client in ops/realtime-check; keys go to it
+  # through the environment and are never printed.
+  docker exec "$DB" psql -U postgres -q -v ON_ERROR_STOP=1 -c "set client_min_messages = warning; create table if not exists public.e2e_realtime(id bigint generated always as identity primary key, note text);
+    grant select on public.e2e_realtime to anon; grant insert on public.e2e_realtime to service_role;
+    do \$\$ begin
+      if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'e2e_realtime') then
+        alter publication supabase_realtime add table public.e2e_realtime;
+      end if;
+    end \$\$; notify pgrst, 'reload schema';"
+  sleep 2
+  if [ ! -f "$RT/check.mjs" ]; then
+    echo "  (realtime helper not found at $RT; set E2E_REALTIME_DIR)"
+  elif [ ! -d "$RT/node_modules/@supabase/supabase-js" ] || [ ! -d "$RT/node_modules/ws" ]; then
+    npm ci --prefix "$RT" --ignore-scripts --no-audit --no-fund --loglevel=error >/dev/null 2>&1 || echo "  (npm ci in $RT failed)"
+  fi
+  RT_OUT=$(SUPABASE_URL="$G" SUPABASE_ANON_KEY="$ANON" SUPABASE_SERVICE_ROLE_KEY="$SVC" REALTIME_TIMEOUT_MS=60000 \
+    node "$RT/check.mjs" 2>&1 | tail -1); RT_RC=${PIPESTATUS[0]}
+  echo "  $RT_OUT"
+  if [ "$RT_RC" = 0 ]; then
+    echo "  PASS  realtime INSERT event received through the gateway"; pass=$((pass+1))
+  else
+    echo "  FAIL  realtime INSERT event not received through the gateway"; fail=$((fail+1))
+  fi
+  # Neither key may appear in the gateway's access log (see log_gate). A
+  # websocket's line is written when its stream ends, so give the realtime
+  # client's connection a moment to be logged first.
+  sleep 3
+  GWC=$(docker ps --filter label=com.docker.compose.project="$SLUG" --filter label=com.docker.compose.service=api-gw --format '{{.Names}}' | head -1)
+  if [ -z "$GWC" ]; then
+    echo "  FAIL  gateway log has no API keys (gateway container not found)"; fail=$((fail+1))
+  else
+    log_gate "$GWC"
+  fi
+
   step "listening sockets (compose binds 0.0.0.0; DOCKER-USER must block them, so probe from outside too)"
   ss -ltnH | awk '{print $4}' | sort -u | tr '\n' ' '; echo
 
@@ -164,7 +240,7 @@ delete)
   api DELETE "/api/projects/$(project_id)" '' 600
   SLUG=$(project_slug)
   CONTAINERS=$(docker ps -aq --filter label=com.docker.compose.project="$SLUG" | wc -l | tr -d ' ')
-  DIRS=$(ls -1 /opt/supaconsole/supabase-projects 2>/dev/null | grep -F "$SLUG" | wc -l | tr -d ' ')
+  DIRS=$(ls -1 "$APP/supabase-projects" 2>/dev/null | grep -F "$SLUG" | wc -l | tr -d ' ')
   VOLUMES=$(docker volume ls -q --filter label=com.docker.compose.project="$SLUG" | wc -l | tr -d ' ')
   NETWORKS=$(docker network ls -q --filter label=com.docker.compose.project="$SLUG" | wc -l | tr -d ' ')
   echo "containers left: $CONTAINERS; project dirs: $DIRS; volumes: $VOLUMES; networks: $NETWORKS"

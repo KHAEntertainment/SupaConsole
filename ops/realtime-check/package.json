@@ -1,0 +1,13 @@
+{
+  "name": "supaconsole-realtime-check",
+  "private": true,
+  "description": "Minimal realtime round-trip check used by ops/e2e.sh verify",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.117.2",
+    "ws": "8.21.3"
+  }
+}
