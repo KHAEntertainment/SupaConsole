@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Mock } from 'vitest'
 import {
   REALTIME_ALIAS,
   renderLegacyOverride,
@@ -9,6 +10,26 @@ import {
   declaredProjectName,
   resolveLegacyProjectName,
 } from '@/lib/engine/layout'
+
+// Mock the docker module for resolveTarget tests
+vi.mock('@/lib/engine/run', () => ({
+  docker: vi.fn(),
+}))
+
+// Mock fs for resolveTarget tests (layout.ts uses `import { promises as fs } from 'fs'`)
+vi.mock('fs', () => ({
+  promises: {
+    readFile: vi.fn(),
+    writeFile: vi.fn(),
+    access: vi.fn(),
+  },
+}))
+
+const { docker } = await import('@/lib/engine/run')
+const { promises: fsPromises } = await import('fs')
+const mockedDocker = docker as Mock
+const mockedReadFile = fsPromises.readFile as Mock
+const mockedAccess = fsPromises.access as Mock
 
 // `docker compose -f docker-compose.yml config --services` for upstream
 // self-hosted/v0.8.2.
@@ -234,5 +255,79 @@ describe('resolveLegacyProjectName', () => {
       source: 'slug',
     })
     expect(resolveLegacyProjectName({ ...base, declaredName: 'Not Valid', containers: [] }).source).toBe('slug')
+  })
+})
+
+describe('resolveTarget', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // Default: no override marker file exists (legacy project), compose file has no name
+    mockedReadFile.mockImplementation((path: string) => {
+      if (path.includes('.supaconsole-project.json')) {
+        return Promise.reject(new Error('ENOENT'))
+      }
+      if (path.includes('docker-compose.yml')) {
+        return Promise.resolve('services: {}\n')
+      }
+      return Promise.reject(new Error('ENOENT'))
+    })
+    mockedAccess.mockResolvedValue(undefined)
+  })
+
+  it('resolves leading-dash slug via compose config when no containers', async () => {
+    // Compose file has invalid name (leading dash), no containers running
+    mockedReadFile.mockImplementation((path: string) => {
+      if (path.includes('.supaconsole-project.json')) {
+        return Promise.reject(new Error('ENOENT'))
+      }
+      if (path.includes('docker-compose.yml')) {
+        return Promise.resolve('name: -demo-123\nservices: {}\n')
+      }
+      return Promise.reject(new Error('ENOENT'))
+    })
+    mockedDocker
+      .mockResolvedValueOnce({ stdout: '' }) // listContainerLabels returns empty
+      .mockResolvedValueOnce({
+        stdout: JSON.stringify({
+          name: 'demo-123',
+          services: {},
+          networks: {},
+          volumes: {},
+        }),
+      }) // resolveNameFromComposeConfig
+    const { resolveTarget } = await import('@/lib/engine/layout')
+    const dockerDir = '/srv/sc/supabase-projects/-demo-123/docker'
+    const result = await resolveTarget(dockerDir, '-demo-123')
+    expect(result.projectName).toBe('demo-123')
+    expect(mockedDocker).toHaveBeenCalledTimes(2)
+    expect(mockedDocker).toHaveBeenNthCalledWith(
+      2,
+      ['compose', '-f', 'docker-compose.yml', 'config', '--format', 'json'],
+      { cwd: dockerDir, timeout: 60000 }
+    )
+  })
+
+  it('does not invoke docker compose config when slug is already valid', async () => {
+    // Compose file has no name, slug is valid
+    mockedReadFile.mockImplementation((path: string) => {
+      if (path.includes('.supaconsole-project.json')) {
+        return Promise.reject(new Error('ENOENT'))
+      }
+      if (path.includes('docker-compose.yml')) {
+        return Promise.resolve('services: {}\n')
+      }
+      return Promise.reject(new Error('ENOENT'))
+    })
+    mockedDocker.mockResolvedValue({ stdout: '' }) // listContainerLabels returns empty
+    const { resolveTarget } = await import('@/lib/engine/layout')
+    const validDockerDir = '/srv/sc/supabase-projects/valid-project/docker'
+    const result = await resolveTarget(validDockerDir, 'valid-project')
+    expect(result.projectName).toBe('valid-project')
+    // docker should only be called for listContainerLabels, not for config
+    expect(mockedDocker).toHaveBeenCalledTimes(1)
+    expect(mockedDocker).toHaveBeenCalledWith(
+      ['ps', '-a', '--no-trunc', '--format', '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}'],
+      { timeout: 60000 }
+    )
   })
 })

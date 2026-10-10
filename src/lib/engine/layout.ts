@@ -97,7 +97,7 @@ export interface LegacyNameInput {
 
 export interface LegacyNameResult {
   projectName: string
-  source: 'containers' | 'compose-name' | 'slug'
+  source: 'containers' | 'compose-name' | 'compose-config' | 'slug'
 }
 
 // The compose project a legacy project must be driven as. It has to equal the
@@ -153,6 +153,19 @@ export async function listContainerLabels(): Promise<ContainerLabels[]> {
     })
 }
 
+async function resolveNameFromComposeConfig(dockerDir: string): Promise<string> {
+  const { stdout } = await docker(
+    ['compose', '-f', COMPOSE_FILE, 'config', '--format', 'json'],
+    { cwd: dockerDir, timeout: 60000 }
+  )
+  const config = JSON.parse(stdout)
+  const name = config.name
+  if (typeof name !== 'string' || !isValidProjectName(name)) {
+    throw new Error(`Cannot determine a usable compose project name for ${dockerDir}`)
+  }
+  return name
+}
+
 export async function resolveTarget(dockerDir: string, slug: string): Promise<ComposeTarget> {
   const meta = await readProjectMeta(dockerDir)
   if (meta) {
@@ -166,13 +179,19 @@ export async function resolveTarget(dockerDir: string, slug: string): Promise<Co
   }
 
   const compose = await fs.readFile(path.join(dockerDir, COMPOSE_FILE), 'utf8')
-  const { projectName, source } = resolveLegacyProjectName({
+  let { projectName, source } = resolveLegacyProjectName({
     slug,
     dockerDir,
     declaredName: declaredProjectName(compose),
     declaredContainerNames: declaredContainerNames(compose),
     containers: await listContainerLabels(),
   })
+
+  if (!isValidProjectName(projectName)) {
+    projectName = await resolveNameFromComposeConfig(dockerDir)
+    source = 'compose-config'
+  }
+
   console.log(`Legacy project ${slug}: compose project "${projectName}" (from ${source})`)
   return { layout: 'legacy', dockerDir, projectName, profile: 'persistent', files: [COMPOSE_FILE, OVERRIDE_FILE] }
 }
