@@ -19,6 +19,9 @@ const eslintConfig = [
       "build/**",
       "next-env.d.ts",
       "fixtures/**",
+      "supabase-core/**",
+      "supabase-projects/**",
+      ".supabase-core-incoming/**",
     ],
   },
 ];
