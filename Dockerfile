@@ -55,8 +55,10 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/next.config.* ./
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/scripts ./scripts
 
 EXPOSE 3000
 
-# Apply schema on start without destructive flags, then start Next.js
-CMD sh -c "npx prisma db push && npm run start"
+# Apply tracked migrations on start (baselines legacy db-push databases in
+# place), then start Next.js
+CMD sh -c "node scripts/db-migrate.mjs && npm run start"

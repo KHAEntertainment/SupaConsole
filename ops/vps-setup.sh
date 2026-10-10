@@ -209,13 +209,11 @@ runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}
   bash -c "cd '${APP_DIR}' && npm ci --no-audit --no-fund --loglevel=error"
 runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
   bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' npx prisma generate" >/dev/null
-# db push: this script is for fresh installs, where prisma/supaconsole.db
-# does not yet have the schema. On an existing DB whose schema matches
-# schema.prisma, db push is a no-op. The script is not meant to be run
-# against a DB with extra columns outside the schema — that needs operator
-# judgement and is documented in ops/README.md under Shared host rules.
+# Tracked migrations (scripts/db-migrate.mjs): creates the schema on a fresh
+# DB, baselines an existing db-push DB in place (additive converge to 0_init
+# only — refused with no changes otherwise), then applies pending migrations.
 runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
-  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' npx prisma db push --skip-generate" >/dev/null
+  bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' node scripts/db-migrate.mjs"
 runuser -u "${SVC_USER}" -- env "HOME=${SVC_HOME}" "npm_config_cache=${SVC_HOME}/.npm" \
   bash -c "cd '${APP_DIR}' && DATABASE_URL='${DB_URL}' NODE_ENV=production npm run build" 2>&1 | tail -15
 

@@ -82,7 +82,7 @@ This repository includes a production-ready `Dockerfile` that:
 - Installs system dependencies required by Prisma (OpenSSL)
 - Installs Git and Curl (used by the app) and the Docker CLI + Compose plugin
 - Generates the Prisma client and builds the Next.js app
-- Runs `prisma db push` on container start (without destructive flags)
+- Applies tracked Prisma migrations on container start (baselines legacy `db push` databases in place)
 - Exposes port `3000`
 
 If you prefer not to use the Dockerfile, you can still use the existing Nixpacks config.
@@ -94,7 +94,7 @@ npm ci && npx prisma generate && npm run build
 
 **Start Command:**
 ```bash
-npx prisma db push && npm start
+NODE_ENV=production node scripts/db-migrate.mjs && npm start
 ```
 
 **Environment Variables:** Same as DokPloy configuration above
@@ -155,7 +155,7 @@ npm ci && npx prisma generate && npm run build
 
 **Start Command:**
 ```bash
-npx prisma db push --accept-data-loss && npm start
+NODE_ENV=production node scripts/db-migrate.mjs && npm start
 ```
 
 **Environment Variables:** Same as DokPloy configuration above
