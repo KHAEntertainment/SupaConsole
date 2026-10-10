@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -193,8 +193,8 @@ describe('health cancels everything an attempt started when it settles', () => {
         { signal: opts.signal }
       )
       insertChild.catch(() => {})
-      while (!existsSync(pidFile) || !require('fs').readFileSync(pidFile, 'utf8')) await new Promise((r) => setTimeout(r, 10))
-      insertPid = Number(require('fs').readFileSync(pidFile, 'utf8'))
+      while (!existsSync(pidFile) || !readFileSync(pidFile, 'utf8')) await new Promise((r) => setTimeout(r, 10))
+      insertPid = Number(readFileSync(pidFile, 'utf8'))
       // The row is "visible" to realtime while the insert process is still running.
       emitInsert(value)
       await insertChild
