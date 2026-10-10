@@ -15,6 +15,7 @@ interface Project {
   createdAt: string
   supabaseRef?: string | null
   supabaseCommit?: string | null
+  health?: { healthy: boolean; checkedAt: string; failed: string[] } | null
 }
 
 export default function DashboardPage() {
@@ -281,8 +282,13 @@ export default function DashboardPage() {
                         <div className={`px-2 py-1 rounded-full text-xs ${
                           project.status === 'active' ? 'bg-green-100 text-green-800' :
                           project.status === 'paused' ? 'bg-yellow-100 text-yellow-800' :
+                          project.status === 'unhealthy' ? 'bg-red-100 text-red-800' :
                           'bg-gray-100 text-gray-800'
-                        }`}>
+                        }`}
+                          title={project.health && !project.health.healthy
+                            ? `Failing: ${project.health.failed.join(', ')} (checked ${new Date(project.health.checkedAt).toLocaleString()})`
+                            : undefined}
+                        >
                           {project.status}
                         </div>
                       </div>
@@ -291,6 +297,11 @@ export default function DashboardPage() {
                       )}
                     </CardHeader>
                     <CardContent>
+                      {project.health && !project.health.healthy && (
+                        <div className="mb-2 text-xs text-red-700">
+                          Failing checks: {project.health.failed.join(', ')}
+                        </div>
+                      )}
                       <div className="mb-3 text-xs text-muted-foreground">
                         Supabase: {project.supabaseRef || 'unknown'}
                         {project.supabaseCommit ? ` · ${project.supabaseCommit.slice(0, 7)}` : ''}

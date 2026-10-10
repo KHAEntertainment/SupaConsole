@@ -23,3 +23,13 @@ export { listServices, writeOverride, pull, up, stop, down, ps } from './compose
 export type { ServiceState } from './compose'
 export { copyDockerTemplate, removeProjectDir } from './files'
 export { checkDockerPrerequisites, checkInternetConnectivity } from './preflight'
+export {
+  HEALTH_FILE,
+  DEFAULT_HEALTH_TIMEOUT_MS,
+  DEFAULT_PROBE_HOST,
+  health,
+  readHealth,
+  writeHealth,
+  describeFailure,
+} from './health'
+export type { HealthCheck, HealthCheckName, HealthResult, HealthOptions } from './health'
