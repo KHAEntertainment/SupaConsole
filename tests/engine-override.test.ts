@@ -264,12 +264,12 @@ describe('resolveTarget', () => {
     // Default: no override marker file exists (legacy project), compose file has no name
     mockedReadFile.mockImplementation((path: string) => {
       if (path.includes('.supaconsole-project.json')) {
-        return Promise.reject(new Error('ENOENT'))
+        return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
       }
       if (path.includes('docker-compose.yml')) {
         return Promise.resolve('services: {}\n')
       }
-      return Promise.reject(new Error('ENOENT'))
+      return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
     })
     mockedAccess.mockResolvedValue(undefined)
   })
@@ -278,12 +278,12 @@ describe('resolveTarget', () => {
     // Compose file has invalid name (leading dash), no containers running
     mockedReadFile.mockImplementation((path: string) => {
       if (path.includes('.supaconsole-project.json')) {
-        return Promise.reject(new Error('ENOENT'))
+        return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
       }
       if (path.includes('docker-compose.yml')) {
         return Promise.resolve('name: -demo-123\nservices: {}\n')
       }
-      return Promise.reject(new Error('ENOENT'))
+      return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
     })
     mockedDocker
       .mockResolvedValueOnce({ stdout: '' }) // listContainerLabels returns empty
@@ -311,12 +311,12 @@ describe('resolveTarget', () => {
     // Compose file has no name, slug is valid
     mockedReadFile.mockImplementation((path: string) => {
       if (path.includes('.supaconsole-project.json')) {
-        return Promise.reject(new Error('ENOENT'))
+        return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
       }
       if (path.includes('docker-compose.yml')) {
         return Promise.resolve('services: {}\n')
       }
-      return Promise.reject(new Error('ENOENT'))
+      return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
     })
     mockedDocker.mockResolvedValue({ stdout: '' }) // listContainerLabels returns empty
     const { resolveTarget } = await import('@/lib/engine/layout')

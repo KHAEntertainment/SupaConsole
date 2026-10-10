@@ -372,7 +372,28 @@ export async function main() {
   }
 
   console.log('[db-migrate] prisma migrate deploy')
-  prismaCli('migrate deploy', repoRoot)
+  try {
+    prismaCli('migrate deploy', repoRoot)
+  } catch (error) {
+    console.error('[db-migrate] After correcting the migration failure, mark the failed migration rolled back before retrying:')
+    let migrationName = '<failed_migration_name>'
+    const { PrismaClient } = await import('@prisma/client')
+    const diagnosticClient = new PrismaClient()
+    try {
+      const failed = await diagnosticClient.$queryRawUnsafe(
+        'SELECT migration_name FROM _prisma_migrations WHERE finished_at IS NULL AND rolled_back_at IS NULL ORDER BY started_at DESC LIMIT 1'
+      )
+      if (failed[0] && /^[A-Za-z0-9_-]+$/.test(failed[0].migration_name)) {
+        migrationName = failed[0].migration_name
+      }
+    } catch {
+      // Migration history may not exist when the engine failed to connect.
+    } finally {
+      await diagnosticClient.$disconnect()
+    }
+    console.error(`[db-migrate] cd ${q(repoRoot)} && DATABASE_URL=${q(url)} npx prisma migrate resolve --rolled-back ${migrationName}`)
+    throw error
+  }
   console.log('[db-migrate] done')
 }
 

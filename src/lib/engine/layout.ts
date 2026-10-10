@@ -51,8 +51,9 @@ export async function readProjectMeta(dockerDir: string): Promise<ProjectMeta | 
   let raw: string
   try {
     raw = await fs.readFile(path.join(dockerDir, PROJECT_META_FILE), 'utf8')
-  } catch {
-    return null
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
   }
   const meta = JSON.parse(raw) as Partial<ProjectMeta>
   if (meta.layout !== 'override' || typeof meta.composeProject !== 'string' || !isValidProjectName(meta.composeProject)) {

@@ -5,6 +5,7 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { prisma } from './db'
 import * as engine from './engine'
+import { createProjectWithPorts, PORT_KEYS } from './ports'
 
 const execFileAsync = promisify(execFile)
 
@@ -416,20 +417,17 @@ export async function initializeSupabaseCore(): Promise<
 }
 
 export async function createProject(name: string, userId: string, description?: string) {
+  let allocatedProjectId: string | undefined
+  let allocatedProjectDir: string | undefined
   try {
-    // Generate unique slug. Replace non-[a-z0-9] runs with a single '-', then
-    // strip leading and trailing dashes so the result is always safe to use as
-    // a Docker container/compose name (which must start with an alphanumeric
-    // character). Two names that collapse to the same base (e.g. 'demo' and
-    // '_demo') will collide; the timestamp plus the DB unique constraint on
-    // slug means a same-ms collision now fails the create instead of merging
-    // stacks. Empty bases fall back to 'project'.
+    // Keep names safe for Compose and use a UUID so same-name concurrent
+    // requests cannot share a directory or collide on the unique slug.
     const timestamp = Date.now()
     const baseSlug = name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '')
-    const slug = `${baseSlug || 'project'}-${timestamp}`
+    const slug = `${baseSlug || 'project'}-${crypto.randomUUID()}`
 
     // Record which Supabase release this project's docker files come from. The
     // ref is recorded only when the checkout verifies against it (meta at its
@@ -439,48 +437,23 @@ export async function createProject(name: string, userId: string, description?: 
     // tracked simply stay null.
     const coreInfo = await readSupabaseCoreInfo(path.join(process.cwd(), 'supabase-core'))
 
-    // Create project in database
-    const project = await prisma.project.create({
-      data: {
-        name,
-        slug,
-        description,
-        ownerId: userId,
-        supabaseRef: coreInfo.ref,
-        supabaseCommit: coreInfo.commit,
-      },
-    })
-    
-    // Copy the release's docker/ directory unmodified. Per-project container
-    // names, the compose project name and the realtime alias come from the
-    // generated override (see lib/engine/override.ts), not from rewriting
-    // upstream's docker-compose.yml.
-    const projectDir = path.join(process.cwd(), 'supabase-projects', slug)
     const coreDockerDir = path.join(process.cwd(), 'supabase-core', 'docker')
+    const upstreamEnv = parseEnvExample(await fs.readFile(path.join(coreDockerDir, '.env.example'), 'utf8'))
+    if (!upstreamEnv.has('API_GW_HTTP_PORT') && !upstreamEnv.has('KONG_HTTP_PORT')) {
+      throw new Error('Supabase template has no gateway port key')
+    }
+    const { project, ports } = await createProjectWithPorts(prisma, {
+      name, slug, description, ownerId: userId,
+      supabaseRef: coreInfo.ref, supabaseCommit: coreInfo.commit,
+    }, PORT_KEYS.filter(key => upstreamEnv.has(key)))
+    const projectDir = path.join(process.cwd(), 'supabase-projects', slug)
+    allocatedProjectId = project.id
+    allocatedProjectDir = projectDir
     const dockerDir = await engine.copyDockerTemplate(coreDockerDir, projectDir)
 
-    // Generate unique default port values to prevent conflicts between projects.
-    // Each key is offset from a per-project base so concurrent projects never collide.
-    const basePort = 8000 + (timestamp % 10000)
-    const portOffsets: Record<string, number> = {
-      API_GW_HTTP_PORT: 0,
-      KONG_HTTP_PORT: 0,
-      KONG_HTTPS_PORT: 443,
-      STUDIO_PORT: 100,
-      ANALYTICS_PORT: 1000,
-      POSTGRES_PORT: 2000,
-      POOLER_PROXY_PORT_TRANSACTION: 3000,
-    }
-
-    // Build the environment from the .env.example that ships with the cloned
-    // Supabase release, so every variable the current compose file expects is
-    // present with a sane value, then override the ones SupaConsole owns.
-    const envExampleFile = path.join(coreDockerDir, '.env.example')
-    const upstreamEnv = parseEnvExample(await fs.readFile(envExampleFile, 'utf8'))
-
     const jwtSecret = generateRandomString(64)
-    const publicUrl = `http://localhost:${basePort}`
-    const tenantId = `project-${timestamp}`
+    const publicUrl = `http://localhost:${ports.API_GW_HTTP_PORT || ports.KONG_HTTP_PORT}`
+    const tenantId = `project-${project.id}`
 
     // Values SupaConsole must own: credentials, signing material, and identity.
     const overrides: Record<string, string> = {
@@ -544,8 +517,8 @@ export async function createProject(name: string, userId: string, description?: 
     // avoids resurrecting variables upstream has retired.
     const defaultEnvVars: Record<string, string> = {}
     for (const [key, upstreamValue] of upstreamEnv) {
-      if (key in portOffsets) {
-        defaultEnvVars[key] = (basePort + portOffsets[key]).toString()
+      if (key in ports) {
+        defaultEnvVars[key] = ports[key]
       } else if (key in overrides) {
         defaultEnvVars[key] = overrides[key]
       } else {
@@ -561,7 +534,7 @@ export async function createProject(name: string, userId: string, description?: 
     // Write initial .env file with unique defaults
     const envFilePath = path.join(dockerDir, '.env')
     const envContent = Object.entries(defaultEnvVars)
-      .map(([key, value]) => `${key}=${value}`)
+      .map(([key, value]) => `${key}=${dotenvValue(value)}`)
       .join('\n')
     
     await fs.writeFile(envFilePath, envContent)
@@ -585,20 +558,35 @@ export async function createProject(name: string, userId: string, description?: 
     
     // Save environment variables to database
     for (const [key, value] of Object.entries(defaultEnvVars)) {
-      await prisma.projectEnvVar.create({
-        data: {
-          projectId: project.id,
-          key,
-          value,
-        },
+      await prisma.projectEnvVar.upsert({
+        where: { projectId_key: { projectId: project.id, key } },
+        create: { projectId: project.id, key, value },
+        update: { value },
       })
     }
     
     return { success: true, project }
   } catch (error) {
+    if (allocatedProjectId) {
+      const cleanup = await Promise.allSettled([
+        prisma.project.delete({ where: { id: allocatedProjectId } }),
+        fs.rm(allocatedProjectDir!, { recursive: true, force: true }),
+      ])
+      for (const result of cleanup) {
+        if (result.status === 'rejected') console.error('Failed to clean up incomplete project:', result.reason)
+      }
+    }
     console.error('Failed to create project:', error)
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
+}
+
+function dotenvValue(value: string): string {
+  return JSON.stringify(value.replace(/\$/g, '$$$$'))
+}
+
+function numericEnvPort(value: string): number {
+  return Number(value.split('#', 1)[0].trim().replace(/^['"]|['"]$/g, '').trim())
 }
 
 export async function updateProjectEnvVars(projectId: string, envVars: Record<string, string>) {
@@ -611,6 +599,37 @@ export async function updateProjectEnvVars(projectId: string, envVars: Record<st
       throw new Error('Project not found')
     }
     
+    // A dotenv value must occupy one line: otherwise another variable could
+    // be injected into the generated file without updating its DB reservation.
+    for (const [key, value] of Object.entries(envVars)) {
+      if (!/^[A-Z][A-Z0-9_]*$/.test(key) || typeof value !== 'string' || /[\r\n]/.test(value)) {
+        throw new Error('Environment variables require valid keys and single-line string values')
+      }
+    }
+
+    // Published ports stay reserved for the lifetime of the project.
+    const storedPorts = await prisma.projectEnvVar.findMany({
+      where: { projectId, key: { in: [...PORT_KEYS] } },
+    })
+    const reservations = await prisma.allocatedPort.findMany({ where: { projectId } })
+    const reservedPorts = new Set(reservations.map(row => row.port))
+    // The configure UI also submits compatibility defaults absent from the
+    // template. Only values backed by this project's reservations are fixed.
+    for (const row of storedPorts) {
+      const storedPort = numericEnvPort(row.value)
+      if (reservedPorts.has(storedPort) && row.key in envVars && envVars[row.key] !== row.value) {
+        throw new Error('Published ports cannot be changed; create a new project to allocate new ports')
+      }
+    }
+
+    for (const [key, value] of Object.entries(envVars)) {
+      if (!PORT_KEYS.some(portKey => portKey === key)) continue
+      const reservation = await prisma.allocatedPort.findUnique({ where: { port: numericEnvPort(value) } })
+      if (reservation && reservation.projectId !== projectId) {
+        throw new Error('Port is reserved by another project')
+      }
+    }
+
     // Update environment variables in database
     for (const [key, value] of Object.entries(envVars)) {
       await prisma.projectEnvVar.upsert({
@@ -645,7 +664,14 @@ export async function updateProjectEnvVars(projectId: string, envVars: Record<st
     }
 
     const envContent = Object.entries(merged)
-      .map(([key, value]) => `${key}=${value}`)
+      .map(([key, value]) => {
+        const port = numericEnvPort(value)
+        const fileValue = PORT_KEYS.some(portKey => portKey === key) && reservedPorts.has(port)
+          ? String(port) : value
+        // Quote values so quotes, comments and backslashes cannot change the
+        // meaning of later dotenv assignments. Legacy quoted ports emit digits.
+        return `${key}=${dotenvValue(fileValue)}`
+      })
       .join('\n')
     
     await fs.writeFile(envFilePath, envContent)
@@ -793,10 +819,29 @@ export async function deleteProject(projectId: string) {
     // the same compose project and files the project was deployed with.
     try {
       console.log(`Stopping Docker containers for project ${project.slug}...`)
-      await engine.down(await engine.resolveTarget(dockerDir, project.slug))
+      const composeExists = await fs.access(path.join(dockerDir, engine.COMPOSE_FILE)).then(() => true).catch(error => {
+        if (error.code === 'ENOENT') return false
+        throw error
+      })
+      if (composeExists) {
+        await engine.down(await engine.resolveTarget(dockerDir, project.slug))
+      } else {
+        const meta = await engine.readProjectMeta(dockerDir)
+        const labels = new Set([
+          `com.docker.compose.project=${project.slug}`,
+          `com.docker.compose.project.working_dir=${dockerDir}`,
+        ])
+        if (meta) labels.add(`com.docker.compose.project=${meta.composeProject}`)
+        for (const label of labels) {
+          const containers = await engine.docker([
+            'ps', '-a', '--filter', `label=${label}`, '--format', '{{.ID}}',
+          ])
+          if (containers.stdout.trim()) throw new Error('Project containers remain but compose file is missing')
+        }
+      }
     } catch (dockerError) {
-      console.warn('Failed to stop Docker containers (they may not be running):', dockerError)
-      // Continue with deletion even if Docker cleanup fails
+      console.error('Failed to stop Docker containers; retaining project and port reservations:', dockerError)
+      throw new Error('Failed to stop project containers; project and ports retained')
     }
 
     // Step 2: Remove project directory (with a root-in-a-container fallback
@@ -806,14 +851,36 @@ export async function deleteProject(projectId: string) {
 
     // Step 3: Clean up database records
     try {
-      // Delete project environment variables
-      await prisma.projectEnvVar.deleteMany({
-        where: { projectId },
-      })
-
-      // Delete the project itself
-      await prisma.project.delete({
-        where: { id: projectId },
+      // Preserve contested legacy reservations before the owner's cascading
+      // delete. The transfer and delete commit together.
+      await prisma.$transaction(async tx => {
+        const ownedPorts = await tx.allocatedPort.findMany({ where: { projectId } })
+        for (const { port } of ownedPorts) {
+          const claimant = await tx.$queryRaw<{ projectId: string }[]>`
+            WITH published_env AS (
+              SELECT env.projectId, projects.createdAt, trim(trim(trim(
+                CASE WHEN instr(env.value, '#') > 0 THEN substr(env.value, 1, instr(env.value, '#') - 1) ELSE env.value END,
+                ' ' || char(9) || char(10) || char(13)), '"' || char(39)),
+                ' ' || char(9) || char(10) || char(13)) AS numericPort
+              FROM project_env_vars AS env JOIN projects ON projects.id = env.projectId
+              WHERE env.projectId <> ${projectId}
+                AND (env.key IN ('API_GW_HTTP_PORT', 'KONG_HTTP_PORT', 'POSTGRES_PORT', 'POOLER_PROXY_PORT_TRANSACTION')
+                  OR (env.key = 'KONG_HTTPS_PORT' AND NOT EXISTS (
+                    SELECT 1 FROM project_env_vars AS gateway
+                    WHERE gateway.projectId = env.projectId AND gateway.key = 'API_GW_HTTP_PORT'
+                  )))
+            )
+            SELECT DISTINCT projectId FROM published_env
+            WHERE numericPort <> '' AND numericPort NOT GLOB '*[^0-9]*'
+              AND CAST(numericPort AS INTEGER) BETWEEN 1 AND 65535
+              AND CAST(numericPort AS INTEGER) = ${port}
+            ORDER BY createdAt, projectId LIMIT 1
+          `
+          if (claimant[0]) {
+            await tx.allocatedPort.update({ where: { port }, data: { projectId: claimant[0].projectId } })
+          }
+        }
+        await tx.project.delete({ where: { id: projectId } })
       })
     } catch (dbError) {
       console.error('Failed to clean up database records:', dbError)
