@@ -215,6 +215,145 @@ INSERT INTO "projects" ("id", "name", "slug", "updatedAt", "ownerId")
 `
 
 describe('db-migrate integration', () => {
+  it('backfills legacy ports, preserves gateway aliases and defaults environments to persistent', async () => {
+    const url = dbUrl(path.join(makeTmpDir(), 'ports.db'))
+    execSql(url, initSql + `
+INSERT INTO users (id, email, password, updatedAt) VALUES ('u1', 'ports@test.local', 'unused', CURRENT_TIMESTAMP);
+INSERT INTO projects (id, name, slug, ownerId, createdAt, updatedAt) VALUES ('p1', 'Kept', 'kept', 'u1', '2020-01-01 00:00:00', CURRENT_TIMESTAMP);
+INSERT INTO projects (id, name, slug, ownerId, createdAt, updatedAt) VALUES ('p2', 'Newer', 'newer', 'u1', '2021-01-01 00:00:00', CURRENT_TIMESTAMP);
+INSERT INTO project_env_vars (id, projectId, key, value, updatedAt) VALUES
+('e1', 'p1', 'API_GW_HTTP_PORT', '22000', CURRENT_TIMESTAMP),
+('e2', 'p1', 'KONG_HTTP_PORT', '22000', CURRENT_TIMESTAMP),
+('e3', 'p1', 'POSTGRES_PORT', char(9) || ' "24000" ' || char(9) || ' # compatibility', CURRENT_TIMESTAMP),
+('e4', 'p1', 'POOLER_PROXY_PORT_TRANSACTION', '25000', CURRENT_TIMESTAMP),
+('e5', 'p1', 'STUDIO_PORT', '3000', CURRENT_TIMESTAMP),
+('e6', 'p1', 'ANALYTICS_PORT', '4000', CURRENT_TIMESTAMP),
+('e7', 'p2', 'API_GW_HTTP_PORT', '22000', CURRENT_TIMESTAMP),
+('e8', 'p2', 'STUDIO_PORT', '3000', CURRENT_TIMESTAMP),
+('e9', 'p2', 'ANALYTICS_PORT', '4000', CURRENT_TIMESTAMP);
+`)
+    const result = runMigrate(url)
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+    await withClient(url, async prisma => {
+      expect(await prisma.project.findUnique({ where: { id: 'p1' } })).toMatchObject({
+        name: 'Kept', environmentType: 'persistent', repository: null, pullRequestNumber: null,
+      })
+      expect(await prisma.project.findUnique({ where: { id: 'p2' } })).toMatchObject({
+        name: 'Newer', environmentType: 'persistent',
+      })
+      expect((await prisma.allocatedPort.findMany({ orderBy: { port: 'asc' } })).map(row => row.port))
+        .toEqual([22000, 24000, 25000])
+      expect(await prisma.allocatedPort.findUnique({ where: { port: 22000 } }))
+        .toMatchObject({ projectId: 'p1' })
+      expect(await prisma.projectEnvVar.count()).toBe(9)
+      await expect(prisma.allocatedPort.create({ data: { port: 22000, projectId: 'p1' } }))
+        .rejects.toMatchObject({ code: 'P2002' })
+      const operation = await prisma.operation.create({ data: { projectId: 'p1', kind: 'create' } })
+      expect(operation.state).toBe('pending')
+      await prisma.project.delete({ where: { id: 'p1' } })
+      expect(await prisma.allocatedPort.count()).toBe(0)
+      expect(await prisma.operation.count()).toBe(0)
+    })
+  }, 120000)
+
+  it('reports the failed migration rollback command and rolls back its DDL', async () => {
+    const sandbox = makeSandbox()
+    const migrationPath = path.join(
+      sandbox,
+      'prisma',
+      'migrations',
+      '20261010070000_ports_environment',
+      'migration.sql'
+    )
+    const migration = readFileSync(migrationPath, 'utf8')
+    expect(migration).toContain('COMMIT;')
+    writeFileSync(
+      migrationPath,
+      migration.replace('COMMIT;', 'THIS IS NOT VALID SQL;\nCOMMIT;')
+    )
+
+    const url = dbUrl(path.join(makeTmpDir(), 'failed-ports-migration.db'))
+    const result = runMigrate(url, {
+      script: path.join(sandbox, 'scripts', 'db-migrate.mjs'),
+    })
+    const output = result.stdout + result.stderr
+    expect(result.status).not.toBe(0)
+    expect(output).toContain(
+      `cd "${sandbox}" && DATABASE_URL="${url}" npx prisma migrate resolve --rolled-back 20261010070000_ports_environment`
+    )
+
+    await withClient(url, async prisma => {
+      expect(await tableExists(url, 'allocated_ports')).toBe(false)
+      const columns = await prisma.$queryRawUnsafe<{ name: string }[]>(
+        'PRAGMA table_info("projects")'
+      )
+      expect(columns.map(column => column.name)).not.toContain('environmentType')
+    })
+  }, 120000)
+
+  it('executes the recovery command against the production env database when the dev env differs', async () => {
+    const sandbox = makeSandbox()
+    const migrationPath = path.join(
+      sandbox,
+      'prisma',
+      'migrations',
+      '20261010070000_ports_environment',
+      'migration.sql'
+    )
+    const migration = readFileSync(migrationPath, 'utf8')
+    writeFileSync(
+      migrationPath,
+      migration.replace('COMMIT;', 'THIS IS NOT VALID SQL;\nCOMMIT;')
+    )
+
+    const devDatabase = path.join(sandbox, 'prisma', 'dev.db')
+    const productionDatabase = path.join(sandbox, 'prisma', 'prod.db')
+    writeFileSync(path.join(sandbox, '.env'), 'DATABASE_URL=file:dev.db\n')
+    writeFileSync(path.join(sandbox, '.env.production'), 'DATABASE_URL=file:prod.db\n')
+
+    // No DATABASE_URL or NODE_ENV is inherited by runMigrate: the script must
+    // select .env.production and canonicalize its file URL against sandbox/prisma.
+    const result = runMigrate(null, {
+      script: path.join(sandbox, 'scripts', 'db-migrate.mjs'),
+      unsetEnv: ['DATABASE_URL', 'NODE_ENV'],
+    })
+    const output = result.stdout + result.stderr
+    expect(result.status).not.toBe(0)
+    expect(output).toContain(`[db-migrate] database: file:${productionDatabase}`)
+
+    const recoveryLine = output.split(/\r?\n/).find(line =>
+      line.includes('npx prisma migrate resolve --rolled-back 20261010070000_ports_environment')
+    )
+    expect(recoveryLine).toBeDefined()
+    const recoveryCommand = recoveryLine!.slice(recoveryLine!.indexOf('cd '))
+    expect(recoveryCommand).toContain(
+      `cd "${sandbox}" && DATABASE_URL="file:${productionDatabase}" npx prisma migrate resolve --rolled-back 20261010070000_ports_environment`
+    )
+
+    const commandEnv: Record<string, string | undefined> = { ...process.env }
+    delete commandEnv.DATABASE_URL
+    delete commandEnv.NODE_ENV
+    const recovered = spawnSync('/bin/sh', ['-c', recoveryCommand], {
+      cwd: repoRoot,
+      env: commandEnv as NodeJS.ProcessEnv,
+      encoding: 'utf8',
+      timeout: 60000,
+    })
+    expect(recovered.status, recovered.stdout + recovered.stderr).toBe(0)
+    expect(existsSync(devDatabase)).toBe(false)
+
+    await withClient(`file:${productionDatabase}`, async prisma => {
+      const failed = await prisma.$queryRawUnsafe<
+        { migration_name: string; rolled_back_at: Date | null }[]
+      >(
+        'SELECT migration_name, rolled_back_at FROM _prisma_migrations WHERE migration_name = ?',
+        '20261010070000_ports_environment'
+      )
+      expect(failed).toHaveLength(1)
+      expect(failed[0].rolled_back_at).not.toBeNull()
+    })
+  }, 120000)
+
   it('adds missing columns to a pre-T3 legacy DB and keeps its rows', async () => {
     const dir = makeTmpDir()
     const file = path.join(dir, 'legacy.db')
