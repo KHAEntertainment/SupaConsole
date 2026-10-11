@@ -41,7 +41,23 @@ SUPABASE_CORE_REPO_URL=git clone --depth 1 https://github.com/supabase/supabase
 # Application
 APP_NAME=SupaConsole Dashboard
 APP_URL=https://your-domain.com
+
+# Post-deploy health checks: where the project gateways are reached from
+# inside this container (the Docker host, not 127.0.0.1)
+SUPACONSOLE_PROBE_HOST=host.docker.internal
 ```
+
+**Health checks from a container:** after `docker compose up`, deploy waits (up to
+`SUPACONSOLE_HEALTH_TIMEOUT_MS`, default 5 minutes) until the project actually serves
+clients: containers healthy, the database through the pooler, then the gateway, auth,
+REST and a realtime round-trip at `http://$SUPACONSOLE_PROBE_HOST:<API_GW_HTTP_PORT>`.
+Inside the SupaConsole container `127.0.0.1` is the container itself, so the probe host
+must be the Docker host: `host.docker.internal` (the compose files map it to
+`host-gateway`) or the bridge gateway IP (e.g. `172.17.0.1`). Persistent projects publish
+their gateway port on all host interfaces, so that address reaches it; make sure the host
+firewall lets the container bridge reach those ports. A host-run SupaConsole keeps the
+default `127.0.0.1`. (Preview projects, which publish on loopback only, will need a
+different probe path; that is Phase 3 work.)
 
 **Generating NEXTAUTH_SECRET:**
 ```bash

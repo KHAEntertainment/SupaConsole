@@ -3,6 +3,7 @@ version: "3.9"
 x-common-env: &common-env
   NODE_ENV: production
   PORT: "3000"
+  SUPACONSOLE_PROBE_HOST: ${SUPACONSOLE_PROBE_HOST:-host.docker.internal}
 
 services:
   docker-proxy:
@@ -26,6 +27,10 @@ services:
       context: .
       dockerfile: ./Dockerfile
     image: supaconsole:local
+    # Lets the post-deploy health checks reach the projects' published
+    # gateway ports on the Docker host (SUPACONSOLE_PROBE_HOST).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:

@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs'
 import * as path from 'path'
-import { docker } from './run'
+import { checkLimits, docker, type RunLimits } from './run'
 import { COMPOSE_FILE, type ComposeTarget } from './layout'
 import { OVERRIDE_FILE, renderLegacyOverride, renderOverride } from './override'
 
@@ -9,17 +9,22 @@ const BUFFER = 1024 * 1024 * 10
 // `docker compose -p <project> -f <file>... <subcommand...>`. Files that are
 // missing on disk are skipped, so `down` still works for a half-created
 // project directory.
-async function composeArgs(target: ComposeTarget, sub: string[]): Promise<string[]> {
+// The limits are re-checked after each file check, and run() checks them
+// again immediately before starting docker, so slow file I/O can't push the
+// command past a deadline.
+async function composeArgs(target: ComposeTarget, sub: string[], limits: RunLimits = {}): Promise<string[]> {
   const args = ['compose', '-p', target.projectName]
   for (const file of target.files) {
     const exists = await fs.access(path.join(target.dockerDir, file)).then(() => true).catch(() => false)
+    checkLimits(limits)
     if (exists) args.push('-f', file)
   }
   return [...args, ...sub]
 }
 
-async function compose(target: ComposeTarget, sub: string[], timeout: number) {
-  return docker(await composeArgs(target, sub), { cwd: target.dockerDir, timeout, maxBuffer: BUFFER })
+async function compose(target: ComposeTarget, sub: string[], timeout: number, limits: RunLimits = {}) {
+  const args = await composeArgs(target, sub, limits)
+  return docker(args, { cwd: target.dockerDir, timeout, maxBuffer: BUFFER, ...limits })
 }
 
 // The services compose itself sees in the upstream file (no override), so the
@@ -67,8 +72,9 @@ export interface ServiceState {
 }
 
 // Compose prints one JSON object per line (older releases print an array).
-export async function ps(target: ComposeTarget): Promise<ServiceState[]> {
-  const { stdout } = await compose(target, ['ps', '-a', '--format', 'json'], 60000)
+export async function ps(target: ComposeTarget, options: RunLimits & { timeout?: number } = {}): Promise<ServiceState[]> {
+  const { timeout = 60000, ...limits } = options
+  const { stdout } = await compose(target, ['ps', '-a', '--format', 'json'], timeout, limits)
   const text = stdout.trim()
   if (!text) return []
   if (text.startsWith('[')) return JSON.parse(text) as ServiceState[]

@@ -39,7 +39,7 @@
 
 ### Prerequisites
 
-- Node.js 18+ 
+- Node.js 20.3+
 - Docker and Docker Compose
 - Git
 - SMTP email service (Gmail, SendGrid, etc.)

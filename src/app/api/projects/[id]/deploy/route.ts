@@ -40,14 +40,17 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
 
     const result = await deployProject(id)
 
+    // `health` is additive: callers that only read `success`/`error` keep
+    // working, and an unhealthy deploy stays a 500 whose error names the
+    // failing checks.
     if (!result.success) {
       return NextResponse.json(
-        { error: result.error },
+        { error: result.error, ...(result.health ? { health: result.health } : {}) },
         { status: 500 }
       )
     }
 
-    return NextResponse.json({ success: true })
+    return NextResponse.json({ success: true, health: result.health })
   } catch (error) {
     console.error('Deploy project error:', error)
     return NextResponse.json(
