@@ -133,3 +133,16 @@ model Operation {
   @@index([projectId, createdAt])
   @@map("operations")
 }
+
+model PreviewToken {
+  id          String    @id @default(uuid())
+  name        String
+  tokenHash   String    @unique
+  tokenLookup String    @unique
+  repository  String
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+  expiresAt   DateTime?
+  @@index([repository, createdAt])
+  @@map("preview_tokens")
+}
