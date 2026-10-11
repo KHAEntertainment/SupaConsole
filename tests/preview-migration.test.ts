@@ -128,9 +128,17 @@ describe('preview state-machine migration', () => {
     )).rejects.toThrow()
   })
 
-  it('converges: the upgraded database matches schema.prisma exactly', () => {
-    expect(schemaDiff(upgradedUrl, ['--to-schema-datamodel', path.join(root, 'prisma', 'schema.prisma')]))
-      .toBe('')
+  it('converges: the full migration chain matches schema.prisma exactly', () => {
+    // Replay the whole migrations folder (not a hardcoded prefix) so the check
+    // stays correct as later tickets add migrations after this one.
+    expect(
+      prismaCli([
+        'migrate', 'diff',
+        '--from-migrations', path.join(root, 'prisma', 'migrations'),
+        '--to-schema-datamodel', path.join(root, 'prisma', 'schema.prisma'),
+        '--script',
+      ]).replace(/^--.*$/gm, '').trim(),
+    ).toBe('')
   })
 })
 

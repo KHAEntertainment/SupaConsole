@@ -249,7 +249,7 @@ INSERT INTO project_env_vars (id, projectId, key, value, updatedAt) VALUES
       await expect(prisma.allocatedPort.create({ data: { port: 22000, projectId: 'p1' } }))
         .rejects.toMatchObject({ code: 'P2002' })
       const operation = await prisma.operation.create({ data: { projectId: 'p1', kind: 'create' } })
-      expect(operation.state).toBe('pending')
+      expect(operation.state).toBe('queued')
       await prisma.project.delete({ where: { id: 'p1' } })
       expect(await prisma.allocatedPort.count()).toBe(0)
       expect(await prisma.operation.count()).toBe(0)
