@@ -1,5 +1,6 @@
 import { randomInt } from 'node:crypto'
 import { Prisma, type PrismaClient } from '@prisma/client'
+import { normalizeBranch, normalizeRepository } from './preview-identity'
 
 // Gateway names are aliases across Supabase releases and share one reservation.
 export const PORT_KEYS = [
@@ -15,7 +16,13 @@ async function allocate(
   for (let attempt = 0; attempt < 40; attempt++) {
     try {
       return await db.$transaction(async tx => {
-        const project = await tx.project.create({ data })
+        const project = await tx.project.create({ data: {
+          ...data,
+          // Identity columns are NULL-or-canonical: empty or whitespace-only
+          // input stores NULL, so persistent rows never collide on the unique key.
+          repository: normalizeRepository(data.repository),
+          branch: normalizeBranch(data.branch),
+        } })
         const ports: Record<string, string> = {}
         const assigned = new Map<string, number>()
         for (const key of keys) {
