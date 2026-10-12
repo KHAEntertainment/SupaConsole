@@ -33,6 +33,7 @@ export interface RunOptions extends RunLimits {
   // secrets reach a child (e.g. `docker exec -e PGPASSWORD`) without
   // appearing in its argument list.
   env?: Record<string, string>
+  input?: string | Buffer
 }
 
 export interface RunResult {
@@ -57,13 +58,19 @@ export async function run(file: string, args: string[], options: RunOptions = {}
       env: options.env ? { ...process.env, ...options.env } : undefined,
     })
     child = pending.child
-    const { stdout, stderr } = await pending
+    const inputWritten = new Promise<void>((resolve, reject) => {
+      if (!child?.stdin) { resolve(); return }
+      child.stdin.once('error', reject)
+      child.stdin.end(options.input, (error?: Error | null) => error ? reject(error) : resolve())
+    })
+    const [{ stdout, stderr }] = await Promise.all([pending, inputWritten])
     return { stdout: String(stdout), stderr: String(stderr) }
   } catch (error) {
-    // An aborted command rejects as soon as the signal fires, before the
-    // child has exited. Wait for it (escalating to SIGKILL), so a cancelled
-    // command is really gone when run() settles.
-    if (child && options.signal?.aborted) await reap(child)
+    // Input and abort errors can reject before the process exits.
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM')
+      await reap(child)
+    }
     throw error
   }
 }

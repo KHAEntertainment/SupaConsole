@@ -163,7 +163,7 @@ describe('operation state machine', () => {
     expect(isTerminalState('pending')).toBe(false)
   })
 
-  async function makeOperation(kind: string) {
+  async function makeOperation(kind: string, environmentType = 'persistent') {
     const owner = await client.user.create({
       data: { email: `t12-${randomBytes(4).toString('hex')}@example.test`, password: 'unused' },
     })
@@ -172,6 +172,8 @@ describe('operation state machine', () => {
         name: `t12-op-${kind}`,
         slug: `t12-op-${kind}-${randomBytes(4).toString('hex')}`,
         ownerId: owner.id,
+        environmentType,
+        status: 'provisioning',
       },
     })
     return client.operation.create({ data: { projectId: project.id, kind } })
@@ -255,27 +257,40 @@ describe('operation state machine', () => {
   })
 
   it('recovers non-terminal operations as failed after a restart, leaving terminal ones alone', async () => {
-    const queued = await makeOperation('recover-queued')
-    const running = await makeOperation('recover-running')
+    const queued = await makeOperation('recover-preview')
+    const running = await makeOperation('recover-preview')
     await transitionOperation(client, running.id, 'provisioning')
-    const done = await makeOperation('recover-done')
+    const done = await makeOperation('recover-preview')
     await transitionOperation(client, done.id, 'provisioning')
     await transitionOperation(client, done.id, 'ready')
+    const previewQueued = await makeOperation('recover-preview', 'preview')
+    const otherKindPreview = await makeOperation('recover-other-kind', 'preview')
 
-    const recovered = await recoverInterruptedOperations(client)
-    expect(recovered).toBeGreaterThanOrEqual(2)
+    const recovered = await recoverInterruptedOperations(client, { kind: 'recover-preview' })
+    expect(recovered).toBe(3)
 
     const rows = await client.operation.findMany({
-      where: { id: { in: [queued.id, running.id, done.id] } },
+      where: { id: { in: [queued.id, running.id, done.id, previewQueued.id, otherKindPreview.id] } },
     })
     const queuedRow = rows.find(row => row.id === queued.id)
     const runningRow = rows.find(row => row.id === running.id)
     const doneRow = rows.find(row => row.id === done.id)
+    const previewQueuedRow = rows.find(row => row.id === previewQueued.id)
+    const otherKindRow = rows.find(row => row.id === otherKindPreview.id)
     expect(queuedRow).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
     expect(runningRow).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
     expect(queuedRow?.finishedAt).not.toBeNull()
     expect(runningRow?.finishedAt).not.toBeNull()
     expect(doneRow?.state).toBe('ready')
+    expect(previewQueuedRow).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
+    expect(otherKindRow?.state).toBe('queued')
+
+    const projects = await client.project.findMany({
+      where: { id: { in: [queued.projectId, running.projectId, done.projectId, previewQueued.projectId, otherKindPreview.projectId] } },
+    })
+    expect(projects.find(project => project.id === previewQueued.projectId)?.status).toBe('failed')
+    expect(projects.find(project => project.id === otherKindPreview.projectId)?.status).toBe('provisioning')
+    expect(projects.find(project => project.id === queued.projectId)?.status).toBe('provisioning')
 
     await expect(transitionOperation(client, queued.id, 'provisioning'))
       .rejects.toBeInstanceOf(IllegalOperationTransitionError)

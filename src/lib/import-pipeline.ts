@@ -83,8 +83,8 @@ export async function importBundle(options: ImportOptions): Promise<ImportResult
     await options.fence()
     const env = databaseEnvironment(options.databaseUrl)
     const adapter = options.execute ?? (async (sql: string) =>
-      run('psql', ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-c', sql], {
-        env, timeout: 60000,
+      run('psql', ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-f', '-'], {
+        env, timeout: 60000, input: sql,
       }))
     const execute = (sql: string) => {
       assertSqlOnly(sql)

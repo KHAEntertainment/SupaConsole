@@ -251,6 +251,55 @@ Optional additional volumes:
 - `/app/supabase-core` – cached Supabase repo clone
 - `/app/supabase-projects` – per-project Docker files
 
+## Preview API
+
+Run one long-lived Next.js Node server per control-plane database. The worker uses
+an in-process serial queue; server startup marks interrupted preview operations
+failed. Keep failed stacks for inspection, then call destroy before ensuring that
+identity again.
+
+Set `PREVIEW_DOMAIN` and `SUPACONSOLE_PREVIEW_BASELINE_VERSION` (a trusted 14-digit
+baseline migration boundary for the pinned `self-hosted/v0.8.2` template). For
+`fixtures/preview-sample`, the boundary is `20261008000400`. Optional
+`SUPACONSOLE_PREVIEW_CORE_DOCKER_DIR` and `SUPACONSOLE_PREVIEW_PROJECTS_ROOT` select
+template and project directories. The defaults are `supabase-core/docker` and
+`supabase-projects`. The preview worker and its loopback gateway probes run on the
+Docker host.
+
+Every endpoint requires a repository-scoped preview token in
+`Authorization: Bearer <token>`.
+
+| Endpoint | Input | Response |
+| --- | --- | --- |
+| `POST /api/previews/ensure` | Query `repository`, `branch`; optional query `pullRequestNumber`, `prTitle`, `prAuthor`; multipart file `tarball` | HTTP 202 with `operationId` and `state` |
+| `GET /api/previews/status` | Query parameters `repository`, `operationId` | `operationId`, `state`, `error`; ready operations also include `url`, `anonKey` |
+| `POST /api/previews/destroy` | Query `repository`; JSON `operationId` (body limit 4 KiB) | `destroyed: true`; repeated destroy succeeds |
+
+Ensure normalizes repository/branch identity and returns the same operation for
+repeated calls, including failed operations. Authorization runs against the query repository before reading
+any request body. Tarballs are limited to 64 MiB and multipart bodies to 65 MiB.
+The worker validates the tarball,
+creates a trimmed stack with fresh credentials, imports SQL with the database
+attached only to an internal Docker network, and runs the health gate before
+marking ready. Destroy joins any local queued work, removes Docker resources and
+the directory, then releases the database row and allocated port.
+
+The public URL is `https://<project-slug>.<PREVIEW_DOMAIN>`. The gateway publishes
+on host loopback; public DNS and proxy/tunnel routing are configured separately.
+Ready means the local stack passed its health gate. SQL seed files replay through
+the importer; the current bundle format does not contain a seed-user manifest.
+Preview projects belong to a reserved service account that cannot log in and does
+not consume the first-user registration slot.
+
+To run Docker acceptance with an isolated SQLite database and the pinned template:
+
+```bash
+DATABASE_URL=file:/tmp/t15-acceptance.db \
+SUPACONSOLE_PREVIEW_CORE_DOCKER_DIR=/path/to/supabase-core/docker \
+T15_DOCKER_TEST=1 T15_CYCLES=20 \
+npx vitest run tests/previews-docker.test.ts --hookTimeout=60000
+```
+
 ## 🤝 Contributing
 
 We welcome contributions! Please follow these steps:

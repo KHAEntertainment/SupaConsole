@@ -75,16 +75,21 @@ export async function recoverInterruptedOperations(
   db: PrismaClient,
   options: { kind?: string } = {},
 ): Promise<number> {
-  const result = await db.operation.updateMany({
-    where: {
-      state: { in: ['queued', 'provisioning'] },
-      ...(options.kind !== undefined ? { kind: options.kind } : {}),
-    },
-    data: {
-      state: 'failed',
-      finishedAt: new Date(),
-      error: 'interrupted by restart',
-    },
+  return db.$transaction(async tx => {
+    const result = await tx.operation.updateMany({
+      where: {
+        state: { in: ['queued', 'provisioning'] },
+        ...(options.kind !== undefined ? { kind: options.kind } : {}),
+      },
+      data: {
+        state: 'failed',
+        finishedAt: new Date(),
+        error: 'interrupted by restart',
+      },
+    })
+    await tx.project.updateMany({ where: { environmentType: 'preview', operations: { some: {
+      state: 'failed', ...(options.kind !== undefined ? { kind: options.kind } : {}),
+    } } }, data: { status: 'failed' } })
+    return result.count
   })
-  return result.count
 }
