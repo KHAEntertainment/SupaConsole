@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs'
 import { prisma } from './db'
+import { PREVIEW_OWNER_EMAIL } from './preview-owner'
 
 export async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, 12)
@@ -30,7 +31,7 @@ export async function validateSession(token: string) {
     include: { user: true },
   })
   
-  if (!session || session.expiresAt < new Date()) {
+  if (!session || session.expiresAt < new Date() || session.user.email === PREVIEW_OWNER_EMAIL) {
     return null
   }
   

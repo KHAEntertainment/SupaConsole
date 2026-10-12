@@ -78,6 +78,31 @@ describe('compose under a deadline', () => {
 })
 
 describe('run under a deadline', () => {
+  it('roundtrips stdin larger than 128 KiB without putting the payload in argv', async () => {
+    const payload = 'large-migration-sql-'.repeat(8000)
+    const script = `let input=''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(1), input })))`
+    const result = await run(process.execPath, ['-e', script], { input: payload })
+
+    expect(JSON.parse(result.stdout)).toEqual({ argv: [], input: payload })
+  })
+
+  it('kills and reaps a child that closes stdin while input is still being written', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'run-stdin-close-'))
+    const pidFile = path.join(dir, 'pid')
+    const script = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => require('fs').closeSync(0), 20); setInterval(() => {}, 1000)`
+
+    try {
+      await expect(run(process.execPath, ['-e', script], { input: Buffer.alloc(8 * 1024 * 1024, 65) })).rejects.toThrow()
+      expect(existsSync(pidFile)).toBe(true)
+      const pid = Number(readFileSync(pidFile, 'utf8'))
+      let alive = true
+      try { process.kill(pid, 0) } catch { alive = false }
+      expect(alive).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('does not start a process at or after the deadline', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'run-deadline-'))
     const marker = path.join(dir, 'started')

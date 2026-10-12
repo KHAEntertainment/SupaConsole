@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { verifyPassword, createSession } from '@/lib/auth'
+import { PREVIEW_OWNER_EMAIL } from '@/lib/preview-owner'
 
 export async function POST(request: NextRequest) {
   try {
@@ -18,7 +19,7 @@ export async function POST(request: NextRequest) {
       where: { email: email.toLowerCase() },
     })
 
-    if (!user) {
+    if (!user || user.email === PREVIEW_OWNER_EMAIL) {
       return NextResponse.json(
         { error: 'Invalid credentials' },
         { status: 401 }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { hashPassword, createSession } from '@/lib/auth'
+import { PREVIEW_OWNER_EMAIL } from '@/lib/preview-owner'
 
 class RegistrationClosedError extends Error {}
 class DuplicateEmailError extends Error {}
@@ -32,7 +33,7 @@ async function createUserAtomically(
   for (let attempt = 1; ; attempt++) {
     try {
       return await prisma.$transaction(async (tx) => {
-        const userCount = await tx.user.count()
+        const userCount = await tx.user.count({ where: { email: { not: PREVIEW_OWNER_EMAIL } } })
         if (!allowRegistration && userCount > 0) {
           throw new RegistrationClosedError('Registration is closed')
         }
@@ -85,6 +86,9 @@ export async function POST(request: NextRequest) {
     // When ALLOW_REGISTRATION is not set, only the first user can register
     const allowRegistration = process.env.ALLOW_REGISTRATION === 'true'
     const normalizedEmail = email.toLowerCase()
+    if (normalizedEmail === PREVIEW_OWNER_EMAIL) {
+      return NextResponse.json({ error: 'Email is reserved' }, { status: 400 })
+    }
 
     // Hash before opening the transaction: bcrypt is slow and must not hold a
     // write lock while it runs.

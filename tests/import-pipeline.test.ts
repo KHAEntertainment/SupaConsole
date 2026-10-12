@@ -61,6 +61,47 @@ describe('import pipeline', () => {
       fence: async () => { throw new Error('No isolation') } })).toMatchObject({ status: 'failed', stage: 'fence' })
     expect(execute).not.toHaveBeenCalled()
   })
+  it('pipes a migration larger than 128 KiB to the default psql adapter stdin', async () => {
+    const input = await bundle()
+    const payload = 'large-sql-payload-'.repeat(9000)
+    await fs.writeFile(path.join(input.migrationsDir, '20261008000600_large_delta.sql'),
+      `create table public.stdin_import_probe (payload text not null);\ninsert into public.stdin_import_probe(payload) values ('${payload}');\n`)
+    const psqlDir = await fs.mkdtemp(path.join(os.tmpdir(), 'import-psql-'))
+    dirs.push(psqlDir)
+    const logPath = path.join(psqlDir, 'calls.jsonl')
+    const psqlPath = path.join(psqlDir, 'psql')
+    await fs.writeFile(psqlPath, `#!/usr/bin/env node
+let sql = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => sql += chunk);
+process.stdin.on('end', () => {
+  require('node:fs').appendFileSync(process.env.PSQL_TEST_LOG, JSON.stringify({ args: process.argv.slice(2), sql }) + '\\n');
+  if (sql.includes('select count(*) from cron.job where active;')) process.stdout.write('0\\n0');
+});
+`)
+    await fs.chmod(psqlPath, 0o755)
+    const originalPath = process.env.PATH
+    const originalLogPath = process.env.PSQL_TEST_LOG
+    process.env.PATH = `${psqlDir}${path.delimiter}${originalPath ?? ''}`
+    process.env.PSQL_TEST_LOG = logPath
+
+    try {
+      const result = await importBundle({ bundle: input, databaseUrl, baselineVersion: '20261008000400', fence: async () => {} })
+
+      expect(result).toMatchObject({ status: 'ready' })
+      const calls = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { args: string[]; sql: string })
+      const largeCall = calls.find(call => call.sql.includes(payload))
+      expect(largeCall).toBeDefined()
+      expect(largeCall?.args).toContain('-f')
+      expect(largeCall?.args).toContain('-')
+      expect(largeCall?.args).not.toContain(payload)
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH
+      else process.env.PATH = originalPath
+      if (originalLogPath === undefined) delete process.env.PSQL_TEST_LOG
+      else process.env.PSQL_TEST_LOG = originalLogPath
+    }
+  })
   it('restores filtered roles and schema after privilege reset, then applies only delta without optional seed', async () => {
     const input = await bundle()
     const execute = vi.fn(async (sql: string) => ({ stdout: sql.startsWith('select count(*)') ? '0\n0' : '', stderr: '' }))
