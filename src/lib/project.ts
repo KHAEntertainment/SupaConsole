@@ -5,6 +5,7 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { prisma } from './db'
 import * as engine from './engine'
+import { generateJWT, generateRandomString } from './project-secrets'
 import { createProjectWithPorts, PORT_KEYS } from './ports'
 
 const execFileAsync = promisify(execFile)
@@ -19,40 +20,6 @@ const DEFAULT_CORE_REF = 'self-hosted/v0.8.2'
 // Written inside supabase-core/ at clone time so later Initialize calls can
 // tell which ref the checkout is at without guessing from branch names.
 const CORE_META_FILE = '.supaconsole-core.json'
-
-// Helper functions for generating secure defaults
-function generateRandomString(length: number): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  let result = ''
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return result
-}
-
-function base64url(input: Buffer | string): string {
-  return Buffer.from(input).toString('base64url')
-}
-
-// Signs a real HS256 JWT with the project's JWT_SECRET.
-// Supabase validates the anon/service_role keys as HS256 JWTs against
-// JWT_SECRET (PostgREST, GoTrue and Realtime all reject a bad signature),
-// so these MUST be genuinely signed rather than carrying a placeholder.
-function generateJWT(role: 'anon' | 'service_role', secret: string, timestamp: number): string {
-  const issuedAt = Math.floor(timestamp / 1000)
-  const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
-  const payload = base64url(JSON.stringify({
-    role,
-    iss: 'supabase',
-    iat: issuedAt,
-    exp: issuedAt + (365 * 24 * 60 * 60),
-  }))
-  const signature = crypto
-    .createHmac('sha256', secret)
-    .update(`${header}.${payload}`)
-    .digest('base64url')
-  return `${header}.${payload}.${signature}`
-}
 
 // Reads KEY=value pairs out of the upstream .env.example that ships inside
 // supabase-core/docker. Using this as the source of truth means new Supabase
