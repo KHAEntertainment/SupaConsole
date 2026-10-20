@@ -6,11 +6,24 @@ import type { PreviewIdentity } from './preview-identity'
 import { PREVIEW_CORE_REF, type PreviewRuntime } from './preview-runtime'
 import { PREVIEW_OWNER_EMAIL } from './preview-owner'
 import { ImportError } from './import-pipeline'
+import { previewHostname, type CloudflareTunnel } from './tunnel'
 
 export { PREVIEW_OWNER_EMAIL } from './preview-owner'
 export const PREVIEW_OPERATION_KIND = 'preview-ensure'
 
 export class PreviewConflictError extends Error {}
+
+// The slice of the tunnel adapter the worker drives; tests inject a stub.
+export type PreviewTunnel = Pick<CloudflareTunnel, 'domain' | 'addPreviewRoute' | 'removePreviewRoute'>
+
+export interface PreviewServiceOptions {
+  tunnel: PreviewTunnel
+  beforeInsert?: () => Promise<void>
+}
+
+// P4-2: the gateway is published on loopback; cloudflared on the same host
+// is the only public path to it.
+function gatewayOrigin(port: string) { return `http://127.0.0.1:${port}` }
 
 async function retryWrite<T>(work: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
@@ -23,12 +36,15 @@ async function retryWrite<T>(work: () => Promise<T>): Promise<T> {
   }
 }
 
-export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, options: { beforeInsert?: () => Promise<void> } = {}) {
+export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, options: PreviewServiceOptions) {
+  const { tunnel } = options
+  const domain = tunnel.domain
   let startup: Promise<number> | undefined
   let queue = Promise.resolve()
   const jobs = new Map<string, Promise<void>>()
   const unfinished = new Map<string, string>()
   const destroying = new Set<string>()
+  const reasserting = new Map<string, Promise<void>>()
   const start = () => startup ??= recoverInterruptedOperations(db, { kind: PREVIEW_OPERATION_KIND })
   async function recordFailure(operationId: string) {
     await retryWrite(() => db.$transaction(async tx => {
@@ -58,12 +74,32 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
     }
     return project.operations[0]
   }
+  // Re-ensure of a ready preview re-asserts its route, reconciling a tunnel
+  // that lost the rule (e.g. the process died between route add and ready
+  // persistence on an earlier attempt). addPreviewRoute replaces an exact
+  // hostname match, so this never duplicates the rule. Destroy waits for an
+  // in-flight re-assert and blocks new ones, so a route cannot outlive its row.
+  function reassertRoute(projectId: string): Promise<void> {
+    if (destroying.has(projectId)) return Promise.resolve()
+    const work = (reasserting.get(projectId) ?? Promise.resolve()).catch(() => undefined).then(async () => {
+      const project = await db.project.findUnique({ where: { id: projectId },
+        include: { envVars: { where: { key: 'API_GW_HTTP_PORT' } } } })
+      const port = project?.envVars[0]?.value
+      if (!project || !port) return
+      await tunnel.addPreviewRoute(previewHostname(project.slug, domain), gatewayOrigin(port))
+    })
+    reasserting.set(projectId, work)
+    return work.finally(() => { if (reasserting.get(projectId) === work) reasserting.delete(projectId) })
+  }
   return {
     start,
     async ensure(identity: PreviewIdentity, tarball: Buffer) {
       await start()
       const previous = await existing(identity)
-      if (previous) return previous
+      if (previous) {
+        if (previous.state === 'ready') await reassertRoute(previous.projectId)
+        return previous
+      }
       const owner = await db.user.upsert({ where: { email: PREVIEW_OWNER_EMAIL }, update: {},
         create: { email: PREVIEW_OWNER_EMAIL, name: 'Preview service', password: '!disabled-preview-service' } })
       await options.beforeInsert?.()
@@ -82,6 +118,7 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       const operation = await db.operation.findFirstOrThrow({ where: { projectId: created.project.id, kind: PREVIEW_OPERATION_KIND } })
       const job = queue.then(async () => {
         let stage = 'claim'
+        let routed: string | undefined
         try {
           await retryWrite(() => transitionOperation(db, operation.id, 'provisioning'))
           stage = 'provision-import-health'
@@ -91,6 +128,12 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
               create: { projectId: created.project.id, key, value }, update: { value },
             }))))
           })
+          // Ready means the public hostname answers through the tunnel, so the
+          // route is added only after the health gate and before ready.
+          stage = 'route-add'
+          const host = previewHostname(created.project.slug, domain)
+          await tunnel.addPreviewRoute(host, gatewayOrigin(created.ports['API_GW_HTTP_PORT']))
+          routed = host
           stage = 'ready-persistence'
           await retryWrite(() => db.$transaction(async tx => {
             await transitionOperation(tx, operation.id, 'ready')
@@ -100,6 +143,10 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
           console.error('Preview worker failed', { operationId: operation.id,
             stage: error instanceof ImportError ? error.stage : stage,
             code: error instanceof ImportError ? error.code : 'PREVIEW_WORKER_FAILED' })
+          // A failed preview is never publicly routed; destroy retries removal.
+          if (routed) await tunnel.removePreviewRoute(routed).catch(() => {
+            console.error('Preview route removal failed', { operationId: operation.id, hostname: routed, stage: 'route-remove' })
+          })
           await recordFailure(operation.id)
         }
       })
@@ -121,7 +168,8 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       }
       const env = Object.fromEntries(operation.project.envVars.map(entry => [entry.key, entry.value]))
       return { operationId: operation.id, state: operation.state, error: operation.error,
-        ...(operation.state === 'ready' ? { url: env.SUPABASE_PUBLIC_URL, anonKey: env.ANON_KEY } : {}) }
+        ...(operation.state === 'ready' ? { url: env.SUPABASE_PUBLIC_URL, anonKey: env.ANON_KEY,
+          hostname: previewHostname(operation.project.slug, domain) } : {}) }
     },
     async destroy(repository: string, operationId: string) {
       await start()
@@ -133,8 +181,18 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       try {
         await jobs.get(operation.projectId)
         await settleUnfinished(operation.projectId)
+        await reasserting.get(operation.projectId)?.catch(() => undefined)
         const current = await db.operation.findUniqueOrThrow({ where: { id: operation.id } })
         if (current.state === 'queued' || current.state === 'provisioning') throw new PreviewConflictError('Operation is running in another worker')
+        // Route removal is idempotent and must not block teardown; a rule left
+        // behind is logged by hostname so it can be removed by hand.
+        let hostname: string | undefined
+        try {
+          hostname = previewHostname(operation.project.slug, domain)
+          await tunnel.removePreviewRoute(hostname)
+        } catch {
+          console.error('Preview route removal failed', { operationId: operation.id, hostname, stage: 'route-remove' })
+        }
         await runtime.destroy(operation.project)
         await db.project.delete({ where: { id: operation.projectId } })
         return true
