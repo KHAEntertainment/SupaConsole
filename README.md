@@ -1,5 +1,7 @@
+> **Work in progress:** this project is becoming a **preview-environments platform for self-hosted Supabase** — one API call provisions a throwaway Supabase stack from your project's `supabase/` folder (migrations, seed data, edge functions), reachable over HTTPS. The README below is from upstream and no longer fully describes the project.
+
 <div align="center">
-  <img src="public/logo.png" alt="SupaConsole Logo" height="50">
+ [![SupaConsole](https://ascii.rest/banner/SupaConsole.svg?color=3fb950&font=tall&shadow=heavy&size=l)](https://ascii.rest/banner/)
   <br />
   <br />
   A modern, self-hosted dashboard for managing multiple Supabase projects with Docker. Built with Next.js, TypeScript, and Tailwind CSS.
