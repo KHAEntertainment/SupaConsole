@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="public/logo.png" alt="SupaConsole Logo" height="50">
+ [![SupaConsole](https://ascii.rest/banner/SupaConsole.svg?color=3fb950&font=tall&shadow=heavy&size=l)](https://ascii.rest/banner/)
   <br />
   <br />
   A modern, self-hosted dashboard for managing multiple Supabase projects with Docker. Built with Next.js, TypeScript, and Tailwind CSS.
