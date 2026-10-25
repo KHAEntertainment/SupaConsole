@@ -1,3 +1,5 @@
+> **Work in progress:** this fork is becoming a **preview-environments platform for self-hosted Supabase** — one API call provisions a throwaway Supabase stack from your project's `supabase/` folder (migrations, seed data, edge functions), reachable over HTTPS. The README below is from upstream and no longer fully describes the project.
+
 <div align="center">
   <img src="public/logo.png" alt="SupaConsole Logo" height="50">
   <br />
