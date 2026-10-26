@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest'
 import { createPreviewService } from '@/lib/previews'
 import { normalizePreviewIdentity } from '@/lib/preview-identity'
 import type { PreviewRuntime } from '@/lib/preview-runtime'
+import { fakeTunnel } from './helpers/fake-tunnel'
 
 let directory: string
 let db: PrismaClient
@@ -76,7 +77,7 @@ it('retries a transient initial provisioning transition and completes the previe
     return undefined
   })
   const stack = runtime()
-  const service = createPreviewService(wrapped.client, stack)
+  const service = createPreviewService(wrapped.client, stack, { tunnel: fakeTunnel() })
 
   const operation = await service.ensure(identity('initial-transition-retry'), Buffer.from('bundle'))
   await service.idle()
@@ -98,7 +99,7 @@ it('retains failed settlement work after persistent writes fail, then settles an
     databaseUnavailable && transactionNumber >= 4 ? prismaFailure('P2028') : undefined,
   )
   const stack = runtime(async () => { throw new Error('provisioning failed') })
-  const service = createPreviewService(wrapped.client, stack)
+  const service = createPreviewService(wrapped.client, stack, { tunnel: fakeTunnel() })
 
   const operation = await service.ensure(identity('failed-settlement-retry'), Buffer.from('bundle'))
   await service.idle()
@@ -130,7 +131,7 @@ it('logs only operation id, import stage, and code when an import failure carrie
   })
   const stage = 'delta:20261008000600_large.sql'
   const stack = runtime(async () => { throw new ImportError(stage, rawCause) })
-  const service = createPreviewService(db, stack)
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
   const log = vi.spyOn(console, 'error').mockImplementation(() => {})
 
   try {
