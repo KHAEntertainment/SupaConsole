@@ -11,6 +11,8 @@
   ![SupaConsole Demo](public/demo.png)
   
   *SupaConsole Dashboard - Manage multiple Supabase projects with ease*
+
+[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both)](https://svg.khaentertainment.com/go)
 </div>
 
 ## ✨ Features
