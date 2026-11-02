@@ -12,7 +12,7 @@
   
   *SupaConsole Dashboard - Manage multiple Supabase projects with ease*
 
-[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both)](https://svg.khaentertainment.com/go)
+[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both&project=KHAEntertainment/SupaConsole)](https://svg.khaentertainment.com/go?project=KHAEntertainment/SupaConsole)
 </div>
 
 ## ✨ Features
