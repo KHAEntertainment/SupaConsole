@@ -82,4 +82,4 @@ SupaConsole is a fork of [sharonpraju/SupaConsole](https://github.com/sharonpraj
 
 ## License
 
-[MIT](LICENSE). Upstream was MIT; this fork retains that license.
+[MIT](LICENSE). Upstream declared MIT but never shipped a LICENSE file; this fork carries it over with the original author's notice preserved.
