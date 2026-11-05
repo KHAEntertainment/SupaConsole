@@ -10,6 +10,7 @@ import { createPreviewRoutes } from '@/lib/preview-routes'
 import { normalizePreviewIdentity } from '@/lib/preview-identity'
 import { verifyPassword } from '@/lib/auth'
 import type { PreviewRuntime } from '@/lib/preview-runtime'
+import { fakeTunnel } from './helpers/fake-tunnel'
 
 let directory: string
 let db: PrismaClient
@@ -35,7 +36,7 @@ it('returns one operation at a uniqueness latch, queues one provision, persists 
   let arrivals = 0
   let release!: () => void
   const latch = new Promise<void>(resolve => { release = resolve })
-  const service = createPreviewService(db, stack, { beforeInsert: async () => {
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel(), beforeInsert: async () => {
     if (++arrivals === 2) release()
     await latch
   } })
@@ -45,7 +46,8 @@ it('returns one operation at a uniqueness latch, queues one provision, persists 
   expect(stack.provision).toHaveBeenCalledTimes(1)
   expect(await db.project.count({ where: { repository: 'acme/app', branch: 'latch' } })).toBe(1)
   expect((await service.ensure(identity('latch'), Buffer.from('replacement'))).id).toBe(a.id)
-  expect(await service.status('acme/app', a.id)).toEqual({ operationId: a.id, state: 'ready', error: null, url: 'https://preview.example.invalid', anonKey: 'synthetic-anon' })
+  expect(await service.status('acme/app', a.id)).toEqual({ operationId: a.id, state: 'ready', error: null, url: 'https://preview.example.invalid', anonKey: 'synthetic-anon',
+    hostname: `${(await db.project.findUniqueOrThrow({ where: { id: a.projectId } })).slug}.preview.example.invalid` })
   expect(await service.status('other/app', a.id)).toBeNull()
   expect(await service.destroy('other/app', a.id)).toBe(false)
   const owner = await db.user.findUniqueOrThrow({ where: { email: PREVIEW_OWNER_EMAIL } })
@@ -62,7 +64,7 @@ it('returns queued immediately, withholds credentials until ready, and destroy j
     await persist({ ANON_KEY: 'private-until-ready', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
     await latch
   })
-  const service = createPreviewService(db, stack)
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
   const operation = await service.ensure(identity('active'), Buffer.from('bundle'))
   expect(operation.state).toBe('queued')
   expect(await service.status('acme/app', operation.id)).not.toHaveProperty('anonKey')
@@ -76,7 +78,7 @@ it('returns queued immediately, withholds credentials until ready, and destroy j
 it('retains failed stacks without exposing diagnostics, then removes them', async () => {
   const stack = runtime()
   stack.provision = vi.fn(async () => { throw new Error('raw stderr containing a secret') })
-  const service = createPreviewService(db, stack)
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
   const operation = await service.ensure(identity('broken'), Buffer.from('bundle'))
   await service.idle()
   const status = await service.status('acme/app', operation.id)
@@ -94,7 +96,7 @@ it('recovers queued and provisioning operations on startup and permits destroy',
   for (const state of ['queued', 'provisioning']) {
     const project = await db.project.create({ data: { ...identity(`recover-${state}`), name: 'interrupted', slug: `recover-${state}`,
       ownerId: owner.id, environmentType: 'preview', operations: { create: { kind: 'preview-ensure', state } } }, include: { operations: true } })
-    const service = createPreviewService(db, runtime())
+    const service = createPreviewService(db, runtime(), { tunnel: fakeTunnel() })
     expect(await service.start()).toBe(1)
     expect(await service.start()).toBe(1)
     expect(await service.status('acme/app', project.operations[0].id)).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
@@ -104,7 +106,7 @@ it('recovers queued and provisioning operations on startup and permits destroy',
 
 it('keeps database state when cleanup fails so destroy can be retried', async () => {
   const stack = runtime()
-  const service = createPreviewService(db, stack)
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
   const operation = await service.ensure(identity('cleanup-retry'), Buffer.from('bundle'))
   await service.idle()
   vi.mocked(stack.destroy).mockRejectedValueOnce(new Error('cleanup failure'))
@@ -114,7 +116,7 @@ it('keeps database state when cleanup fails so destroy can be retried', async ()
 })
 
 it('authenticates every route, validates input, normalizes identity and prevents cross-repository reads', async () => {
-  const service = createPreviewService(db, runtime())
+  const service = createPreviewService(db, runtime(), { tunnel: fakeTunnel() })
   const authenticate = vi.fn(async (request: NextRequest, repository: string) => {
     if (request.headers.get('authorization') !== 'Bearer synthetic' || repository !== 'acme/app') {
       return { ok: false as const, response: NextResponse.json({ error: 'invalid token' }, { status: 401 }) }

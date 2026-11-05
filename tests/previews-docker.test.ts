@@ -11,6 +11,7 @@ import { createPreviewRuntime } from '@/lib/preview-runtime'
 import { createPreviewService } from '@/lib/previews'
 import { createPreviewRoutes } from '@/lib/preview-routes'
 import { issuePreviewToken } from '@/lib/preview-tokens'
+import { fakeTunnel } from './helpers/fake-tunnel'
 
 async function tarball(cwd: string) {
   const archive = c({ cwd, gzip: true }, ['supabase'])
@@ -28,7 +29,8 @@ it.skipIf(process.env.T15_DOCKER_TEST !== '1')('authenticated real-stack ensure/
   let arrivals = 0
   let release!: () => void
   const latch = new Promise<void>(resolve => { release = resolve })
-  const service = createPreviewService(prisma, stack, { beforeInsert: async () => {
+  const tunnel = fakeTunnel('t15.example.invalid')
+  const service = createPreviewService(prisma, stack, { tunnel, beforeInsert: async () => {
     if (arrivals >= 2) return
     if (++arrivals === 2) release()
     await latch
@@ -153,7 +155,7 @@ it.skipIf(process.env.T15_DOCKER_TEST !== '1')('authenticated real-stack ensure/
     process.kill(-child.pid!, 'SIGKILL')
     await exited
     child = undefined
-    const restarted = createPreviewService(prisma, stack)
+    const restarted = createPreviewService(prisma, stack, { tunnel })
     expect(await restarted.start()).toBe(1)
     expect(await restarted.status('t15/app', operationId)).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
     await restarted.destroy('t15/app', operationId)
