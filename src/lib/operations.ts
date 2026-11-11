@@ -73,13 +73,16 @@ export async function transitionOperation(
 // recoverable as failed rather than driven to completion.
 export async function recoverInterruptedOperations(
   db: PrismaClient,
-  options: { kind?: string } = {},
+  options: { kind?: string; ids?: string[] } = {},
 ): Promise<number> {
+  // `ids` narrows recovery to operations whose external cleanup (e.g. tunnel
+  // route removal) already succeeded; the rest stay recoverable on a retry.
   return db.$transaction(async tx => {
     const result = await tx.operation.updateMany({
       where: {
         state: { in: ['queued', 'provisioning'] },
         ...(options.kind !== undefined ? { kind: options.kind } : {}),
+        ...(options.ids !== undefined ? { id: { in: options.ids } } : {}),
       },
       data: {
         state: 'failed',
@@ -89,6 +92,7 @@ export async function recoverInterruptedOperations(
     })
     await tx.project.updateMany({ where: { environmentType: 'preview', operations: { some: {
       state: 'failed', ...(options.kind !== undefined ? { kind: options.kind } : {}),
+      ...(options.ids !== undefined ? { id: { in: options.ids } } : {}),
     } } }, data: { status: 'failed' } })
     return result.count
   })
