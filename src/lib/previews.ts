@@ -45,7 +45,46 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   const unfinished = new Map<string, string>()
   const destroying = new Set<string>()
   const reasserting = new Map<string, Promise<void>>()
-  const start = () => startup ??= recoverInterruptedOperations(db, { kind: PREVIEW_OPERATION_KIND })
+  // Interrupted operations whose tunnel route could not be removed yet
+  // (operationId -> slug). They stay non-terminal so cleanup is retryable.
+  const pendingRoutes = new Map<string, string>()
+  // Remove each interrupted preview's route before its operation is marked
+  // failed; returns the operation ids whose route is gone (or never possible).
+  async function clearInterruptedRoutes(entries: Array<[string, string]>): Promise<string[]> {
+    const cleared: string[] = []
+    for (const [operationId, slug] of entries) {
+      let hostname: string
+      try { hostname = previewHostname(slug, domain) } catch { pendingRoutes.delete(operationId); cleared.push(operationId); continue }
+      try {
+        await tunnel.removePreviewRoute(hostname)
+        pendingRoutes.delete(operationId)
+        cleared.push(operationId)
+      } catch {
+        pendingRoutes.set(operationId, slug)
+        console.error('Preview route removal failed', { operationId, hostname, stage: 'route-remove-recovery' })
+      }
+    }
+    return cleared
+  }
+  async function recover(): Promise<number> {
+    const interrupted = await db.operation.findMany({ where: { kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } },
+      include: { project: { select: { slug: true } } } })
+    const cleared = await clearInterruptedRoutes(interrupted.map(operation => [operation.id, operation.project.slug]))
+    return recoverInterruptedOperations(db, { kind: PREVIEW_OPERATION_KIND, ids: cleared })
+  }
+  async function retryPendingRoutes() {
+    if (pendingRoutes.size === 0) return
+    const cleared = await clearInterruptedRoutes([...pendingRoutes])
+    await recoverInterruptedOperations(db, { kind: PREVIEW_OPERATION_KIND, ids: cleared })
+  }
+  const start = async () => {
+    // The call that runs the sweep does not retry in the same breath; later
+    // calls (every ensure/status/destroy) retry whatever is still pending.
+    const first = !startup
+    const recovered = await (startup ??= recover())
+    if (!first) await retryPendingRoutes()
+    return recovered
+  }
   async function recordFailure(operationId: string) {
     await retryWrite(() => db.$transaction(async tx => {
       let operation = await tx.operation.findUniqueOrThrow({ where: { id: operationId } })

@@ -6,6 +6,7 @@ import { PrismaClient } from '@prisma/client'
 import { NextRequest, NextResponse } from 'next/server'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import { createPreviewService, PREVIEW_OWNER_EMAIL } from '@/lib/previews'
+import { previewHostname } from '@/lib/tunnel'
 import { createPreviewRoutes } from '@/lib/preview-routes'
 import { normalizePreviewIdentity } from '@/lib/preview-identity'
 import { verifyPassword } from '@/lib/auth'
@@ -102,6 +103,46 @@ it('recovers queued and provisioning operations on startup and permits destroy',
     expect(await service.status('acme/app', project.operations[0].id)).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
     await service.destroy('acme/app', project.operations[0].id)
   }
+})
+
+async function interruptedPreview(slug: string) {
+  const owner = await db.user.findUniqueOrThrow({ where: { email: PREVIEW_OWNER_EMAIL } })
+  return db.project.create({ data: { ...identity(slug), name: 'interrupted', slug,
+    ownerId: owner.id, environmentType: 'preview', operations: { create: { kind: 'preview-ensure', state: 'provisioning' } } },
+  include: { operations: true } })
+}
+
+it('removes an interrupted preview route before marking its operation failed', async () => {
+  const tunnel = fakeTunnel()
+  const project = await interruptedPreview('route-recover-ok')
+  const host = previewHostname(project.slug, tunnel.domain)
+  await tunnel.addPreviewRoute(host, 'http://127.0.0.1:9')
+  expect(tunnel.routes()).toHaveLength(1)
+  const service = createPreviewService(db, runtime(), { tunnel })
+  expect(await service.start()).toBe(1)
+  expect(tunnel.routes()).toHaveLength(0)
+  expect(await service.status('acme/app', project.operations[0].id)).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
+  await service.destroy('acme/app', project.operations[0].id)
+})
+
+it('leaves an interrupted operation retryable when route removal fails', async () => {
+  const tunnel = fakeTunnel()
+  const project = await interruptedPreview('route-recover-retry')
+  const operationId = project.operations[0].id
+  await tunnel.addPreviewRoute(previewHostname(project.slug, tunnel.domain), 'http://127.0.0.1:9')
+  const remove = vi.spyOn(tunnel, 'removePreviewRoute').mockRejectedValueOnce(new Error('tunnel unavailable'))
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  const service = createPreviewService(db, runtime(), { tunnel })
+  expect(await service.start()).toBe(0)
+  expect(await db.operation.findUniqueOrThrow({ where: { id: operationId } })).toMatchObject({ state: 'provisioning' })
+  expect(tunnel.routes()).toHaveLength(1)
+  // The next call retries the pending removal and only then marks it failed.
+  await service.start()
+  expect(remove).toHaveBeenCalledTimes(2)
+  expect(tunnel.routes()).toHaveLength(0)
+  expect(await db.operation.findUniqueOrThrow({ where: { id: operationId } })).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
+  vi.restoreAllMocks()
+  await service.destroy('acme/app', operationId)
 })
 
 it('keeps database state when cleanup fails so destroy can be retried', async () => {
