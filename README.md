@@ -6,7 +6,7 @@
 
 **Send it your `supabase/` folder, and SupaConsole provisions an isolated Supabase backend for each pull request, migrations, seed data, and edge functions included.**
 
-[![License](https://img.shields.io/github/license/KHAEntertainment/SupaConsole)](LICENSE) [![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both)](https://svg.khaentertainment.com/go)
+[![License](https://img.shields.io/github/license/KHAEntertainment/SupaConsole)](LICENSE) [![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both&project=KHAEntertainment/SupaConsole)](https://svg.khaentertainment.com/go?project=KHAEntertainment/SupaConsole)
 
 [Try it](#try-it) | [Preview environments](#preview-environments) | [What it does](#the-solution) | [Credits](#credits)
 
