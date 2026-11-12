@@ -6,7 +6,7 @@ import type { PreviewIdentity } from './preview-identity'
 import { PREVIEW_CORE_REF, type PreviewRuntime } from './preview-runtime'
 import { PREVIEW_OWNER_EMAIL } from './preview-owner'
 import { ImportError } from './import-pipeline'
-import { bundleContentHash } from './bundle-ingest'
+import { bundleContentHash, type BundleContentHash } from './bundle-ingest'
 import { previewHostname, type CloudflareTunnel } from './tunnel'
 
 export { PREVIEW_OWNER_EMAIL } from './preview-owner'
@@ -42,13 +42,24 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   const domain = tunnel.domain
   let startup: Promise<number> | undefined
   let queue = Promise.resolve()
-  const jobs = new Map<string, Promise<void>>()
-  const unfinished = new Map<string, string>()
+  // projectId -> the newest job entry; entries carry their operation id so
+  // a finished job can only ever delete its own entry (T20 review finding 2).
+  const jobs = new Map<string, { operationId: string; promise: Promise<void> }>()
+  // projectId -> operations whose job settled without reaching a terminal
+  // state record (their failure persistence itself failed). Several can
+  // pile up per project, one per attempt.
+  const unfinished = new Map<string, Set<string>>()
   const destroying = new Set<string>()
-  // Ensures that passed their `destroying` check but have not yet
-  // registered their job. Destroy waits these out, so teardown can never
-  // interleave with a provision that is just starting (T20).
-  const ensuring = new Set<string>()
+  // projectId -> registration tokens for ensures that passed their
+  // `destroying` check but have not yet registered their job. Each ensure
+  // owns its token and releases only that, so overlapping registrations
+  // cannot clear each other (T20 review finding 1); destroy drains the
+  // whole set so teardown never interleaves with a starting provision.
+  const ensuring = new Map<string, Set<symbol>>()
+  // (repository, branch) -> tail of the claim critical section: re-read,
+  // hash compare and claim run serialized per preview so two identical
+  // bundles cannot both claim a rebuild (T20 review finding 5).
+  const claims = new Map<string, Promise<unknown>>()
   const reasserting = new Map<string, Promise<void>>()
   // Interrupted operations whose tunnel route could not be removed yet
   // (operationId -> slug). They stay non-terminal so cleanup is retryable.
@@ -90,36 +101,44 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
     if (!first) await retryPendingRoutes()
     return recovered
   }
-  async function recordFailure(operationId: string) {
+  async function recordFailure(operationId: string, message = 'Preview provisioning, import or health failed') {
     await retryWrite(() => db.$transaction(async tx => {
       let operation = await tx.operation.findUniqueOrThrow({ where: { id: operationId } })
       if (operation.state === 'queued') operation = await transitionOperation(tx, operationId, 'provisioning')
       if (operation.state === 'provisioning') {
-        await transitionOperation(tx, operationId, 'failed', { error: 'Preview provisioning, import or health failed' })
-        // Only the last standing attempt owns the project status: while a
-        // newer update is still queued the project stays 'provisioning'.
-        const other = await tx.operation.findFirst({ where: { projectId: operation.projectId,
-          kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } } })
-        if (!other) await tx.project.update({ where: { id: operation.projectId }, data: { status: 'failed' } })
+        await transitionOperation(tx, operationId, 'failed', { error: message })
+        // Only the owning attempt writes project status (T20 review finding
+        // 6): a late settlement of an older attempt must never overwrite the
+        // current environment's status.
+        await tx.project.updateMany({ where: { id: operation.projectId, currentOperationId: operationId },
+          data: { status: 'failed' } })
       }
     }))
   }
   async function settleUnfinished(projectId: string) {
-    const operationId = unfinished.get(projectId)
-    if (!operationId) return
-    await recordFailure(operationId)
+    const pending = unfinished.get(projectId)
+    if (!pending) return
+    for (const operationId of [...pending]) await recordFailure(operationId)
     unfinished.delete(projectId)
-    jobs.delete(projectId)
+    // Delete only this settlement's own job entry; a newer attempt's job
+    // must stay tracked for destroy (T20 review finding 2).
+    const tracked = jobs.get(projectId)
+    if (tracked && pending.has(tracked.operationId)) jobs.delete(projectId)
   }
   async function existing(identity: PreviewIdentity) {
     const project = await db.project.findUnique({ where: { repository_branch: { repository: identity.repository, branch: identity.branch } },
       include: { operations: { where: { kind: PREVIEW_OPERATION_KIND }, orderBy: { createdAt: 'desc' }, take: 3 } } })
     if (!project) return null
     if (project.environmentType !== 'preview' || !project.operations[0]) throw new PreviewConflictError('Identity belongs to a different environment')
-    // The operation that currently owns the environment: an in-flight one
-    // when there is one (an update queued behind an earlier attempt), else
-    // the most recent attempt.
-    const operation = project.operations.find(candidate => candidate.state === 'queued' || candidate.state === 'provisioning') ?? project.operations[0]
+    // The operation that currently owns the environment: the claim recorded
+    // it atomically with the bundle hash (T20 review finding 6), so an older
+    // unsettled attempt can never be picked as current. Rows without a
+    // recorded owner fall back to the newest attempt.
+    const operation = (project.currentOperationId !== null
+      ? project.operations.find(candidate => candidate.id === project.currentOperationId) ?? null
+      : null)
+      ?? project.operations.find(candidate => candidate.state === 'queued' || candidate.state === 'provisioning')
+      ?? project.operations[0]
     if (unfinished.has(project.id)) {
       await settleUnfinished(project.id)
       return { project, operation: await db.operation.findUniqueOrThrow({ where: { id: operation.id } }) }
@@ -144,6 +163,34 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
     if (!ports['API_GW_HTTP_PORT']) throw new Error('Preview has no allocated gateway port')
     return ports
   }
+  function claimKey(identity: PreviewIdentity) { return `${identity.repository}\u0000${identity.branch}` }
+  // Serialize the re-read -> compare -> claim critical section per preview
+  // (T20 review finding 5). The create path stays outside: its uniqueness
+  // latch is the serialization there.
+  function claimLock<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const tail = (claims.get(key) ?? Promise.resolve()).catch(() => undefined)
+    const run = tail.then(work)
+    const settled = run.then(() => undefined, () => undefined)
+    claims.set(key, settled)
+    return run.finally(() => { if (claims.get(key) === settled) claims.delete(key) })
+  }
+  // Register a provision job: chained on the serial queue and tracked per
+  // project until it settles, so destroy can wait out everything that is
+  // still running for its project (T20 review findings 1 and 2).
+  function schedule(projectId: string, operationId: string, task: () => Promise<void>) {
+    const job = queue.then(task)
+    const settled = job.catch(() => {
+      const pending = unfinished.get(projectId) ?? new Set<string>()
+      pending.add(operationId)
+      unfinished.set(projectId, pending)
+    }).finally(() => {
+      const pending = unfinished.get(projectId)
+      if (!pending?.has(operationId) && jobs.get(projectId)?.operationId === operationId) jobs.delete(projectId)
+    })
+    jobs.set(projectId, { operationId, promise: settled })
+    queue = settled
+    return settled
+  }
   // Re-ensure of a ready preview re-asserts its route, reconciling a tunnel
   // that lost the rule (e.g. the process died between route add and ready
   // persistence on an earlier attempt). addPreviewRoute replaces an exact
@@ -156,6 +203,13 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
         include: { envVars: { where: { key: 'API_GW_HTTP_PORT' } } } })
       const port = project?.envVars[0]?.value
       if (!project || !port) return
+      // Only a ready current attempt may open the route (T20 review finding
+      // 4): a late re-assert carrying a stale snapshot must not re-route a
+      // preview whose update has claimed or is rebuilding.
+      const owner = project.currentOperationId === null
+        ? null
+        : await db.operation.findUnique({ where: { id: project.currentOperationId } })
+      if (owner && owner.state !== 'ready') return
       await tunnel.addPreviewRoute(previewHostname(project.slug, domain), gatewayOrigin(port))
     })
     reasserting.set(projectId, work)
@@ -199,11 +253,8 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       stage = 'ready-persistence'
       await retryWrite(() => db.$transaction(async tx => {
         await transitionOperation(tx, operation.id, 'ready')
-        // Only the last standing attempt owns the project status: while a
-        // newer update is queued the project stays 'provisioning'.
-        const other = await tx.operation.findFirst({ where: { projectId: project.id,
-          kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } } })
-        if (!other) await tx.project.update({ where: { id: project.id }, data: { status: 'active' } })
+        // Only the owning attempt writes project status (T20 review finding 6).
+        await tx.project.updateMany({ where: { id: project.id, currentOperationId: operation.id }, data: { status: 'active' } })
       }))
     } catch (error) {
       console.error('Preview worker failed', { operationId: operation.id,
@@ -228,27 +279,69 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
     // Destroy owns the end state: an update must not start against a
     // preview that is being torn down.
     if (destroying.has(project.id)) throw new PreviewConflictError('Destroy already in progress')
-    ensuring.add(project.id)
+    const token = Symbol('ensure-registration')
+    const tokens = ensuring.get(project.id) ?? new Set<symbol>()
+    tokens.add(token)
+    ensuring.set(project.id, tokens)
     try {
       const ports = await projectPorts(project.id)
       const operation = await retryWrite(() => db.$transaction(async tx => {
         const created = await tx.operation.create({ data: { projectId: project.id, kind: PREVIEW_OPERATION_KIND } })
+        // The claim is atomic (T20): hash, owner and status move together,
+        // so only this attempt may write project status from here on.
         await tx.project.update({ where: { id: project.id }, data: {
-          status: 'provisioning', bundleHash: hash, ...metadataPatch(project, identity) } })
+          status: 'provisioning', bundleHash: hash, currentOperationId: created.id,
+          ...metadataPatch(project, identity) } })
         return created
       }))
       // The serial queue runs one provision at a time: a second ensure with
       // another bundle queues behind the running one instead of racing it.
-      const job = queue.then(() => runWorker(operation, project, ports, tarball, true))
-      const settled = job.catch(() => { unfinished.set(project.id, operation.id) }).finally(() => {
-        if (!unfinished.has(project.id) && jobs.get(project.id) === settled) jobs.delete(project.id)
-      })
-      jobs.set(project.id, settled)
-      queue = settled
+      schedule(project.id, operation.id, () => runWorker(operation, project, ports, tarball, true))
       return operation
     } finally {
-      ensuring.delete(project.id)
+      // Release only this registration's token (T20 review finding 1).
+      const owned = ensuring.get(project.id)
+      owned?.delete(token)
+      if (owned && owned.size === 0) ensuring.delete(project.id)
     }
+  }
+  // Resolve an ensure against an existing preview. Called under the claim
+  // lock with an authoritative re-read, so the hash comparison and the
+  // claim are atomic per preview (T20 review finding 5).
+  async function resolveExisting(project: Project, operation: Operation, identity: PreviewIdentity,
+    tarball: Buffer, bundle: BundleContentHash): Promise<Operation> {
+    const patch = metadataPatch(project, identity)
+    if (bundle.hash === project.bundleHash) {
+      // This exact bundle is already applied, being applied, or already
+      // failed: same-hash ensures never start new work, and a failed
+      // attempt stays failed — the fix that recovers it changes the hash.
+      if (Object.keys(patch).length > 0) {
+        await retryWrite(() => db.project.update({ where: { id: project.id }, data: patch }))
+      }
+      if (operation.state === 'ready') await reassertRoute(project.id)
+      return operation
+    }
+    if (!bundle.valid) {
+      // A bundle with no validated contents (T20 review finding 9): ingest
+      // would reject it, so it must never claim a rebuild or tear down a
+      // running preview. Record the failed attempt instead; the live stack,
+      // route and the recorded bundleHash stay untouched.
+      const failure = await retryWrite(() => db.$transaction(async tx => {
+        const created = await tx.operation.create({ data: { projectId: project.id, kind: PREVIEW_OPERATION_KIND } })
+        if (Object.keys(patch).length > 0) await tx.project.update({ where: { id: project.id }, data: patch })
+        return created
+      }))
+      await recordFailure(failure.id, 'Bundle failed validation or has no migrations; the existing preview was left untouched')
+      return db.operation.findUniqueOrThrow({ where: { id: failure.id } })
+    }
+    return startUpdate(project, identity, tarball, bundle.hash)
+  }
+  function lockedResolve(identity: PreviewIdentity, tarball: Buffer, bundle: BundleContentHash): Promise<Operation> {
+    return claimLock(claimKey(identity), async () => {
+      const fresh = await existing(identity)
+      if (!fresh) throw new PreviewConflictError('Preview was destroyed during the request')
+      return resolveExisting(fresh.project, fresh.operation, identity, tarball, bundle)
+    })
   }
   return {
     start,
@@ -257,47 +350,30 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       // Change detection (decision 3): a hash of the validated bundle
       // contents. A repacked tarball with identical files never counts as
       // a change; any real content change re-provisions.
-      const hash = await bundleContentHash(tarball)
+      const bundle = await bundleContentHash(tarball)
       const previous = await existing(identity)
-      if (previous) {
-        const { project, operation } = previous
-        if (hash !== project.bundleHash) return startUpdate(project, identity, tarball, hash)
-        // This exact bundle is already applied, being applied, or already
-        // failed: same-hash ensures never start new work, and a failed
-        // attempt stays failed — the fix that recovers it changes the hash.
-        const patch = metadataPatch(project, identity)
-        if (Object.keys(patch).length > 0) {
-          await retryWrite(() => db.project.update({ where: { id: project.id }, data: patch }))
-        }
-        if (operation.state === 'ready') await reassertRoute(project.id)
-        return operation
-      }
+      if (previous) return lockedResolve(identity, tarball, bundle)
       const owner = await db.user.upsert({ where: { email: PREVIEW_OWNER_EMAIL }, update: {},
         create: { email: PREVIEW_OWNER_EMAIL, name: 'Preview service', password: '!disabled-preview-service' } })
       await options.beforeInsert?.()
       let created: Awaited<ReturnType<typeof createProjectWithPorts>>
+      // The operation id is generated up front so the project row can name
+      // its owner in the same write (T20 review finding 6).
+      const operationId = randomUUID()
       try {
         created = await createProjectWithPorts(db, {
           ...identity, name: `${identity.repository} / ${identity.branch}`, slug: `preview-${randomUUID()}`,
           ownerId: owner.id, environmentType: 'preview', status: 'provisioning', supabaseRef: PREVIEW_CORE_REF,
-          bundleHash: hash,
-          operations: { create: { kind: PREVIEW_OPERATION_KIND } },
+          bundleHash: bundle.hash, currentOperationId: operationId,
+          operations: { create: { id: operationId, kind: PREVIEW_OPERATION_KIND } },
         }, ['API_GW_HTTP_PORT'])
       } catch (error) {
         const winner = await existing(identity)
-        if (winner) {
-          if (hash === winner.project.bundleHash) return winner.operation
-          return startUpdate(winner.project, identity, tarball, hash)
-        }
+        if (winner) return lockedResolve(identity, tarball, bundle)
         throw error
       }
-      const operation = await db.operation.findFirstOrThrow({ where: { projectId: created.project.id, kind: PREVIEW_OPERATION_KIND } })
-      const job = queue.then(() => runWorker(operation, created.project, created.ports, tarball, false))
-      const settled = job.catch(() => { unfinished.set(created.project.id, operation.id) }).finally(() => {
-        if (!unfinished.has(created.project.id) && jobs.get(created.project.id) === settled) jobs.delete(created.project.id)
-      })
-      jobs.set(created.project.id, settled)
-      queue = settled
+      const operation = await db.operation.findFirstOrThrow({ where: { id: operationId, projectId: created.project.id, kind: PREVIEW_OPERATION_KIND } })
+      schedule(created.project.id, operation.id, () => runWorker(operation, created.project, created.ports, tarball, false))
       return operation
     },
     async status(repository: string, operationId: string) {
@@ -310,8 +386,16 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
         operation = await db.operation.findUniqueOrThrow({ where: { id: operation.id }, include: { project: { include: { envVars: true } } } })
       }
       const env = Object.fromEntries(operation.project.envVars.map(entry => [entry.key, entry.value]))
+      // Connection details describe the PROJECT's live environment, not one
+      // operation's historical state (T20 review finding 3): while a newer
+      // attempt is rebuilding or has failed, an old ready operation exposes
+      // no url, anonKey or hostname.
+      const owner = operation.project.currentOperationId === null
+        ? null
+        : await db.operation.findUnique({ where: { id: operation.project.currentOperationId } })
+      const live = owner ? owner.state === 'ready' : operation.state === 'ready'
       return { operationId: operation.id, state: operation.state, error: operation.error,
-        ...(operation.state === 'ready' ? { url: env.SUPABASE_PUBLIC_URL, anonKey: env.ANON_KEY,
+        ...(operation.state === 'ready' && live ? { url: env.SUPABASE_PUBLIC_URL, anonKey: env.ANON_KEY,
           hostname: previewHostname(operation.project.slug, domain) } : {}) }
     },
     async destroy(repository: string, operationId: string) {
@@ -322,11 +406,14 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       if (destroying.has(operation.projectId)) throw new PreviewConflictError('Destroy already in progress')
       destroying.add(operation.projectId)
       try {
-        // An ensure that passed its own destroying check just before this
-        // one landed is still registering its job; wait it out so teardown
-        // cannot interleave with a provision that is starting (T20).
-        while (ensuring.has(operation.projectId)) await new Promise(resolve => setImmediate(resolve))
-        await jobs.get(operation.projectId)
+        // Ensures that passed their own destroying check just before this
+        // one landed are still registering; wait out EVERY registration and
+        // then the newest tracked job, which chains all earlier ones (T20
+        // review findings 1 and 2). After the drain no new registration can
+        // be accepted, so the tracked job is the complete chain.
+        while ((ensuring.get(operation.projectId)?.size ?? 0) > 0) await new Promise(resolve => setImmediate(resolve))
+        const tracked = jobs.get(operation.projectId)
+        if (tracked) await tracked.promise
         await settleUnfinished(operation.projectId)
         await reasserting.get(operation.projectId)?.catch(() => undefined)
         const current = await db.operation.findUniqueOrThrow({ where: { id: operation.id } })

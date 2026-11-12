@@ -65,6 +65,12 @@ model Project {
   // re-ensure whether the environment is already current (same hash) or
   // must be re-provisioned from the new bundle (different hash).
   bundleHash String?
+  // The operation that currently owns this preview's environment (T20).
+  // Written atomically with the claim that sets bundleHash; only this
+  // attempt may write project status, and same-hash lookups return it.
+  // Null on rows that predate the claim (e.g. restored/backfilled data),
+  // where callers fall back to the newest operation.
+  currentOperationId String?
 
   // Owner
   ownerId     String

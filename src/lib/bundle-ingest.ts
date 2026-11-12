@@ -518,6 +518,46 @@ async function validateBundle(opts: {
   }
   await Promise.all(drained)
 
+  // Symlink-parent aliasing (T20 review finding 7): a write under an
+  // archive-created symlink lands on the symlink's target, so two archives
+  // that differ only in write order can extract different code. Reject the
+  // whole bundle instead: no entry may live under a path the archive itself
+  // turns into a symlink. Checked after the full parse so entry order
+  // cannot dodge it, and in validation so ingest and hashing agree.
+  const symlinkPaths = new Set<string>()
+  for (const entry of out) {
+    if (entry.linkTarget !== undefined) symlinkPaths.add(entry.destPath)
+  }
+  if (symlinkPaths.size > 0) {
+    for (const entry of out) {
+      let parent = path.dirname(entry.destPath)
+      while (parent !== supabaseRoot && parent !== path.dirname(parent)) {
+        if (symlinkPaths.has(parent)) {
+          throw new InvalidBundleError(
+            `Bundle entry is written through an archive symlink parent: ${JSON.stringify(entry.rawPath)}`,
+            entry.rawPath
+          )
+        }
+        parent = path.dirname(parent)
+      }
+    }
+  }
+  // Directory markers colliding with file or symlink entries fail
+  // extraction order-dependently (mkdir over a file, or write over a
+  // directory), so reject them here for the same reason.
+  const writtenPaths = new Set<string>()
+  for (const entry of out) {
+    if (entry.mode !== undefined) writtenPaths.add(entry.destPath)
+  }
+  for (const entry of out) {
+    if (entry.mode === undefined && writtenPaths.has(entry.destPath)) {
+      throw new InvalidBundleError(
+        `Bundle entry collides with a file or symlink at the same path: ${JSON.stringify(entry.rawPath)}`,
+        entry.rawPath
+      )
+    }
+  }
+
   if (migrationsSeen === 0) {
     throw new NoMigrationsError()
   }
@@ -1009,7 +1049,15 @@ const HASH_IN_TREE_FUNCTIONS_PATH = path.join(HASH_ROOT, 'supabase', 'functions'
 // falls back to a domain-separated hash of the raw bytes: an identical
 // retry stays a no-op, and any different bytes re-attempt (and fail)
 // once. The two domains can never collide.
-export async function bundleContentHash(input: Buffer | Uint8Array): Promise<string> {
+export interface BundleContentHash {
+  // sha256 over the extracted, validated contents (or, when the bundle has
+  // no validated contents, a domain-separated hash of the raw bytes).
+  hash: string
+  // False when the bundle failed validation or contains no migrations:
+  // there were no validated contents to hash and ingest would reject it.
+  valid: boolean
+}
+export async function bundleContentHash(input: Buffer | Uint8Array): Promise<BundleContentHash> {
   const tarball = asBuffer(input)
   try {
     const entries = await validateBundle({
@@ -1018,13 +1066,13 @@ export async function bundleContentHash(input: Buffer | Uint8Array): Promise<str
       functionsMountPath: HASH_IN_TREE_FUNCTIONS_PATH,
       inTreeFunctionsPath: HASH_IN_TREE_FUNCTIONS_PATH,
     })
-    return await hashValidatedContents(entries, tarball)
+    return { hash: await hashValidatedContents(entries, tarball), valid: true }
   } catch (error) {
     if (error instanceof InvalidBundleError || error instanceof NoMigrationsError) {
       const raw = createHash('sha256')
       raw.update('bundle-raw-v1\n')
       raw.update(tarball)
-      return raw.digest('hex')
+      return { hash: raw.digest('hex'), valid: false }
     }
     throw error
   }
@@ -1066,10 +1114,19 @@ async function hashValidatedContents(entries: ValidatedEntry[], tarball: Buffer)
   }
 
   const digest = createHash('sha256')
-  digest.update('bundle-contents-v1\n')
+  digest.update('bundle-contents-v2\n')
   for (const key of [...records.keys()].sort()) {
     const record = records.get(key)!
-    digest.update(`${key}\n${record.kind}\n${record.digest}\n`)
+    const keyBytes = Buffer.from(key, 'utf8')
+    // Length-prefixed, newline-free framing (review finding 8): no field
+    // value can forge a record boundary, so distinct (path, kind, content)
+    // sets can never serialize to the same preimage.
+    const length = Buffer.alloc(4)
+    length.writeUInt32BE(keyBytes.length)
+    digest.update(length)
+    digest.update(keyBytes)
+    digest.update(Buffer.from([record.kind === 'symlink' ? 0x01 : 0x00]))
+    digest.update(Buffer.from(record.digest, 'hex'))
   }
   return digest.digest('hex')
 }
