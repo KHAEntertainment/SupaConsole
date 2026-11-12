@@ -6,6 +6,7 @@ import * as path from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  bundleContentHash,
   ingestBundle,
   InvalidBundleError,
   normalizeMode,
@@ -700,5 +701,46 @@ describe('ingestBundle: stale staging sweep (P3-6)', () => {
     expect(leftover.filter((n) => n.startsWith('.supabase-old-'))).toEqual([])
     expect(leftover.filter((n) => n.startsWith('.functions-old-'))).toEqual([])
     expect(leftover).toContain('supabase')
+  })
+})
+
+describe('bundleContentHash (T20 change detection)', () => {
+  const base = () => buildTarball([
+    { name: 'supabase/migrations/0001_a.sql', body: 'create table a;' },
+    { name: 'supabase/migrations/0002_b.sql', body: 'create table b;' },
+    { name: 'supabase/seed.sql', body: 'insert into a;' },
+  ])
+
+  it('hashes validated contents, not tarball bytes: a repack of the same files matches', async () => {
+    const repacked = buildTarball([
+      { name: './supabase/seed.sql', body: 'insert into a;', mode: 0o600 },
+      { name: 'supabase/migrations/0002_b.sql', body: 'create table b;', mode: 0o755 },
+      { name: 'supabase/migrations/0001_a.sql', body: 'create table a;' },
+    ])
+    // Different entry order, modes and name shape: raw bytes differ...
+    expect(repacked.equals(base())).toBe(false)
+    // ...but the extracted, validated contents are the same files.
+    expect(await bundleContentHash(repacked)).toBe(await bundleContentHash(base()))
+  })
+
+  it('changes when a validated file changes', async () => {
+    const changed = buildTarball([
+      { name: 'supabase/migrations/0001_a.sql', body: 'create table a;' },
+      { name: 'supabase/migrations/0002_b.sql', body: 'create table b cascade;' },
+      { name: 'supabase/seed.sql', body: 'insert into a;' },
+    ])
+    expect(await bundleContentHash(changed)).not.toBe(await bundleContentHash(base()))
+  })
+
+  it('falls back to a deterministic raw hash for bundles with no validated contents', async () => {
+    const garbage = Buffer.from('not a tarball')
+    expect(await bundleContentHash(garbage)).toBe(await bundleContentHash(Buffer.from('not a tarball')))
+    expect(await bundleContentHash(garbage)).not.toBe(await bundleContentHash(Buffer.from('other garbage')))
+    // Parses cleanly but has no migrations: still no validated contents.
+    const noMigrations = buildTarball([{ name: 'supabase/seed.sql', body: 'insert into a;' }])
+    expect(await bundleContentHash(noMigrations)).not.toBe(await bundleContentHash(garbage))
+    expect(await bundleContentHash(noMigrations)).toBe(
+      await bundleContentHash(buildTarball([{ name: 'supabase/seed.sql', body: 'insert into a;' }])),
+    )
   })
 })
