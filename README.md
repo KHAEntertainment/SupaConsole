@@ -4,7 +4,7 @@
 
 ### Throwaway Supabase backends for every pull request
 
-**Send it your `supabase/` folder, and SupaConsole provisions an isolated Supabase backend for each pull request, migrations, seed data, and edge functions included.**
+**Send it your `supabase/` folder, and SupaConsole provisions an isolated Supabase backend for each branch, migrations, seed data, and edge functions included.**
 
 [![License](https://img.shields.io/github/license/KHAEntertainment/SupaConsole)](LICENSE) [![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both&project=KHAEntertainment/SupaConsole)](https://svg.khaentertainment.com/go?project=KHAEntertainment/SupaConsole)
 
@@ -20,11 +20,11 @@ The Supabase CLI's `start` gives you a stack, but it's a development-grade one, 
 
 ## The solution
 
-SupaConsole turns a branch into a disposable environment. Send it the `supabase/` folder, and it provisions an isolated stack, applies the migrations and seed, and hands back a URL and an anon key you can give a client. Repeat the call and nothing changes. Tear the PR down and the whole stack goes with it.
+SupaConsole turns a branch into a disposable environment. Send it the `supabase/` folder, and it provisions an isolated stack, applies the migrations and seed, and hands back a URL and an anon key you can give a client. Calls are keyed by repository and branch: repeating `ensure` for the same branch returns the existing environment and doesn't read the new bundle, so a new commit doesn't update it yet (that comes with the GitHub Action, Phase 5). Destroy it and the whole stack goes with it.
 
-Isolation is the point, so each preview gets its own Postgres, not a shared cluster. The bundle is untrusted code, so a path that escapes the project directory, a hardlink, or a setuid bit is rejected rather than written to disk. Preview tokens are hashed at rest and scoped to one repository.
+Isolation is the point, so each preview gets its own Postgres, not a shared cluster. The bundle is untrusted code, so a path that escapes the project directory or a hardlink is rejected, and setuid, setgid, and sticky bits are stripped before files are written. Preview tokens are hashed at rest and scoped to one repository.
 
-A trimmed preview (db, Envoy, auth, rest, realtime, storage, imgproxy, functions) idles around 540 MiB, versus about 1 GiB for the full upstream stack.
+A trimmed preview (db, Envoy, auth, rest, realtime, storage, imgproxy, functions) idled at about 630 MiB in a one-off `docker stats` reading on the 4 vCPU / 8 GB test droplet, versus roughly 1.15 to 1.26 GiB for the full upstream stack. Treat these as observed estimates, not a benchmark.
 
 It's also still the tool it was forked from: a dashboard that creates and manages long-lived Supabase projects.
 
@@ -46,7 +46,7 @@ You need Node.js 20+, Docker with Compose, and git. SMTP is only for password-re
    cp .env.example .env
    ```
 
-   Set `NEXTAUTH_SECRET` to a random string. The rest of the defaults work for a first run.
+   Set `NEXTAUTH_SECRET` to a random string. Also change `DATABASE_URL`: the default (`file:/app/data/db.sqlite`) is a path inside the container. Running on your host, use something writable like `file:./dev.db`, which resolves to `prisma/dev.db`. The other defaults work for a first run.
 
 3. Set up the database and start:
 
@@ -63,7 +63,7 @@ Registration starts in bootstrap mode, so only the first user can sign up unless
 
 The preview flow is three calls, all authenticated with a scoped token:
 
-- `ensure` takes the `supabase/` bundle and returns an operation id. The worker extracts it, provisions a stack bound to loopback, applies migrations and seed, waits for real health (gateway, auth, a REST query, a realtime round-trip), then adds a Cloudflare tunnel route.
+- `ensure` takes the `supabase/` bundle and returns an operation id. The worker extracts it, provisions a stack bound to loopback, applies migrations and seed, waits for real health (gateway, auth, a REST query, a realtime round-trip), then adds a Cloudflare tunnel route. The health probe targets `127.0.0.1`, so it works when SupaConsole runs on the same host as the previews. In the [Dokploy container deployment](DOKPLOY_SETUP.md), `127.0.0.1` is the container itself and the gate fails, so previews aren't supported there yet.
 - `status` reports the state and, once ready, the HTTPS hostname and anon key.
 - `destroy` removes the route and tears down every container, volume, and directory.
 
