@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import type { PrismaClient } from '@prisma/client'
-import { createProjectWithPorts } from './ports'
+import type { PrismaClient, Operation, Project } from '@prisma/client'
+import { createProjectWithPorts, PORT_KEYS } from './ports'
 import { recoverInterruptedOperations, transitionOperation } from './operations'
 import type { PreviewIdentity } from './preview-identity'
 import { PREVIEW_CORE_REF, type PreviewRuntime } from './preview-runtime'
 import { PREVIEW_OWNER_EMAIL } from './preview-owner'
 import { ImportError } from './import-pipeline'
+import { bundleContentHash } from './bundle-ingest'
 import { previewHostname, type CloudflareTunnel } from './tunnel'
 
 export { PREVIEW_OWNER_EMAIL } from './preview-owner'
@@ -44,6 +45,10 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   const jobs = new Map<string, Promise<void>>()
   const unfinished = new Map<string, string>()
   const destroying = new Set<string>()
+  // Ensures that passed their `destroying` check but have not yet
+  // registered their job. Destroy waits these out, so teardown can never
+  // interleave with a provision that is just starting (T20).
+  const ensuring = new Set<string>()
   const reasserting = new Map<string, Promise<void>>()
   // Interrupted operations whose tunnel route could not be removed yet
   // (operationId -> slug). They stay non-terminal so cleanup is retryable.
@@ -91,7 +96,11 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       if (operation.state === 'queued') operation = await transitionOperation(tx, operationId, 'provisioning')
       if (operation.state === 'provisioning') {
         await transitionOperation(tx, operationId, 'failed', { error: 'Preview provisioning, import or health failed' })
-        await tx.project.update({ where: { id: operation.projectId }, data: { status: 'failed' } })
+        // Only the last standing attempt owns the project status: while a
+        // newer update is still queued the project stays 'provisioning'.
+        const other = await tx.operation.findFirst({ where: { projectId: operation.projectId,
+          kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } } })
+        if (!other) await tx.project.update({ where: { id: operation.projectId }, data: { status: 'failed' } })
       }
     }))
   }
@@ -104,14 +113,36 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   }
   async function existing(identity: PreviewIdentity) {
     const project = await db.project.findUnique({ where: { repository_branch: { repository: identity.repository, branch: identity.branch } },
-      include: { operations: { where: { kind: PREVIEW_OPERATION_KIND }, orderBy: { createdAt: 'desc' }, take: 1 } } })
+      include: { operations: { where: { kind: PREVIEW_OPERATION_KIND }, orderBy: { createdAt: 'desc' }, take: 3 } } })
     if (!project) return null
     if (project.environmentType !== 'preview' || !project.operations[0]) throw new PreviewConflictError('Identity belongs to a different environment')
+    // The operation that currently owns the environment: an in-flight one
+    // when there is one (an update queued behind an earlier attempt), else
+    // the most recent attempt.
+    const operation = project.operations.find(candidate => candidate.state === 'queued' || candidate.state === 'provisioning') ?? project.operations[0]
     if (unfinished.has(project.id)) {
       await settleUnfinished(project.id)
-      return db.operation.findUniqueOrThrow({ where: { id: project.operations[0].id } })
+      return { project, operation: await db.operation.findUniqueOrThrow({ where: { id: operation.id } }) }
     }
-    return project.operations[0]
+    return { project, operation }
+  }
+  // pullRequestNumber is metadata, not identity (decision 1): a re-ensure
+  // from another PR onto the same branch updates the stored number on the
+  // existing environment instead of forking a second one. Only a different
+  // non-null number is written; a missing one leaves the stored value.
+  function metadataPatch(project: { pullRequestNumber: number | null }, identity: PreviewIdentity) {
+    return identity.pullRequestNumber != null && identity.pullRequestNumber !== project.pullRequestNumber
+      ? { pullRequestNumber: identity.pullRequestNumber }
+      : {}
+  }
+  // Ports are allocated once, at create time, and persist as env vars across
+  // re-provisions, so the slug (hostname) and the gateway origin stay
+  // stable across an update (decision 2).
+  async function projectPorts(projectId: string): Promise<Record<string, string>> {
+    const rows = await db.projectEnvVar.findMany({ where: { projectId, key: { in: [...PORT_KEYS] } } })
+    const ports = Object.fromEntries(rows.map(row => [row.key, row.value]))
+    if (!ports['API_GW_HTTP_PORT']) throw new Error('Preview has no allocated gateway port')
+    return ports
   }
   // Re-ensure of a ready preview re-asserts its route, reconciling a tunnel
   // that lost the rule (e.g. the process died between route add and ready
@@ -130,14 +161,116 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
     reasserting.set(projectId, work)
     return work.finally(() => { if (reasserting.get(projectId) === work) reasserting.delete(projectId) })
   }
+  // The provision pipeline shared by create and update. `teardown` is the
+  // T20 update path: the DB row (and its slug and ports) survives, the
+  // route is pulled before the old stack goes down and re-added only after
+  // the health gate passes, so a routed hostname always answers (T17).
+  async function runWorker(operation: { id: string }, project: Project, ports: Record<string, string>, tarball: Buffer, teardown: boolean) {
+    let stage = 'claim'
+    let routed: string | undefined
+    let host: string | undefined
+    try {
+      await retryWrite(() => transitionOperation(db, operation.id, 'provisioning'))
+      host = previewHostname(project.slug, domain)
+      if (teardown) {
+        stage = 'route-remove'
+        // A re-assert landing after removal would reopen the route mid-
+        // rebuild; wait for it the way destroy does. Removal itself is
+        // idempotent and must never block teardown.
+        await reasserting.get(project.id)?.catch(() => undefined)
+        try { await tunnel.removePreviewRoute(host) } catch {
+          console.error('Preview route removal failed', { operationId: operation.id, hostname: host, stage: 'route-remove' })
+        }
+        stage = 'teardown'
+        await runtime.destroy(project)
+      }
+      stage = 'provision-import-health'
+      await runtime.provision(project, tarball, ports, async env => {
+        await retryWrite(() => db.$transaction(Object.entries(env).map(([key, value]) => db.projectEnvVar.upsert({
+          where: { projectId_key: { projectId: project.id, key } },
+          create: { projectId: project.id, key, value }, update: { value },
+        }))))
+      })
+      // Ready means the public hostname answers through the tunnel, so the
+      // route is added only after the health gate and before ready.
+      stage = 'route-add'
+      await tunnel.addPreviewRoute(host, gatewayOrigin(ports['API_GW_HTTP_PORT']))
+      routed = host
+      stage = 'ready-persistence'
+      await retryWrite(() => db.$transaction(async tx => {
+        await transitionOperation(tx, operation.id, 'ready')
+        // Only the last standing attempt owns the project status: while a
+        // newer update is queued the project stays 'provisioning'.
+        const other = await tx.operation.findFirst({ where: { projectId: project.id,
+          kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } } })
+        if (!other) await tx.project.update({ where: { id: project.id }, data: { status: 'active' } })
+      }))
+    } catch (error) {
+      console.error('Preview worker failed', { operationId: operation.id,
+        stage: error instanceof ImportError ? error.stage : stage,
+        code: error instanceof ImportError ? error.code : 'PREVIEW_WORKER_FAILED' })
+      // A failed preview is never publicly routed; destroy retries removal.
+      // On the update path the rule may predate this job (its teardown
+      // removal failed), so it is retried here as well.
+      const leftover = routed ?? (teardown ? host : undefined)
+      if (leftover) await tunnel.removePreviewRoute(leftover).catch(() => {
+        console.error('Preview route removal failed', { operationId: operation.id, hostname: leftover, stage: 'route-remove' })
+      })
+      await recordFailure(operation.id)
+    }
+  }
+  // T20 update: re-provision an existing preview from a changed bundle under
+  // the same project row. The row keeps its slug and allocated ports, so the
+  // hostname is unchanged; the old stack is torn down first because the
+  // import pipeline restores from empty and is not re-runnable on a live
+  // database.
+  async function startUpdate(project: Project, identity: PreviewIdentity, tarball: Buffer, hash: string): Promise<Operation> {
+    // Destroy owns the end state: an update must not start against a
+    // preview that is being torn down.
+    if (destroying.has(project.id)) throw new PreviewConflictError('Destroy already in progress')
+    ensuring.add(project.id)
+    try {
+      const ports = await projectPorts(project.id)
+      const operation = await retryWrite(() => db.$transaction(async tx => {
+        const created = await tx.operation.create({ data: { projectId: project.id, kind: PREVIEW_OPERATION_KIND } })
+        await tx.project.update({ where: { id: project.id }, data: {
+          status: 'provisioning', bundleHash: hash, ...metadataPatch(project, identity) } })
+        return created
+      }))
+      // The serial queue runs one provision at a time: a second ensure with
+      // another bundle queues behind the running one instead of racing it.
+      const job = queue.then(() => runWorker(operation, project, ports, tarball, true))
+      const settled = job.catch(() => { unfinished.set(project.id, operation.id) }).finally(() => {
+        if (!unfinished.has(project.id) && jobs.get(project.id) === settled) jobs.delete(project.id)
+      })
+      jobs.set(project.id, settled)
+      queue = settled
+      return operation
+    } finally {
+      ensuring.delete(project.id)
+    }
+  }
   return {
     start,
     async ensure(identity: PreviewIdentity, tarball: Buffer) {
       await start()
+      // Change detection (decision 3): a hash of the validated bundle
+      // contents. A repacked tarball with identical files never counts as
+      // a change; any real content change re-provisions.
+      const hash = await bundleContentHash(tarball)
       const previous = await existing(identity)
       if (previous) {
-        if (previous.state === 'ready') await reassertRoute(previous.projectId)
-        return previous
+        const { project, operation } = previous
+        if (hash !== project.bundleHash) return startUpdate(project, identity, tarball, hash)
+        // This exact bundle is already applied, being applied, or already
+        // failed: same-hash ensures never start new work, and a failed
+        // attempt stays failed — the fix that recovers it changes the hash.
+        const patch = metadataPatch(project, identity)
+        if (Object.keys(patch).length > 0) {
+          await retryWrite(() => db.project.update({ where: { id: project.id }, data: patch }))
+        }
+        if (operation.state === 'ready') await reassertRoute(project.id)
+        return operation
       }
       const owner = await db.user.upsert({ where: { email: PREVIEW_OWNER_EMAIL }, update: {},
         create: { email: PREVIEW_OWNER_EMAIL, name: 'Preview service', password: '!disabled-preview-service' } })
@@ -147,50 +280,21 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
         created = await createProjectWithPorts(db, {
           ...identity, name: `${identity.repository} / ${identity.branch}`, slug: `preview-${randomUUID()}`,
           ownerId: owner.id, environmentType: 'preview', status: 'provisioning', supabaseRef: PREVIEW_CORE_REF,
+          bundleHash: hash,
           operations: { create: { kind: PREVIEW_OPERATION_KIND } },
         }, ['API_GW_HTTP_PORT'])
       } catch (error) {
         const winner = await existing(identity)
-        if (winner) return winner
+        if (winner) {
+          if (hash === winner.project.bundleHash) return winner.operation
+          return startUpdate(winner.project, identity, tarball, hash)
+        }
         throw error
       }
       const operation = await db.operation.findFirstOrThrow({ where: { projectId: created.project.id, kind: PREVIEW_OPERATION_KIND } })
-      const job = queue.then(async () => {
-        let stage = 'claim'
-        let routed: string | undefined
-        try {
-          await retryWrite(() => transitionOperation(db, operation.id, 'provisioning'))
-          stage = 'provision-import-health'
-          await runtime.provision(created.project, tarball, created.ports, async env => {
-            await retryWrite(() => db.$transaction(Object.entries(env).map(([key, value]) => db.projectEnvVar.upsert({
-              where: { projectId_key: { projectId: created.project.id, key } },
-              create: { projectId: created.project.id, key, value }, update: { value },
-            }))))
-          })
-          // Ready means the public hostname answers through the tunnel, so the
-          // route is added only after the health gate and before ready.
-          stage = 'route-add'
-          const host = previewHostname(created.project.slug, domain)
-          await tunnel.addPreviewRoute(host, gatewayOrigin(created.ports['API_GW_HTTP_PORT']))
-          routed = host
-          stage = 'ready-persistence'
-          await retryWrite(() => db.$transaction(async tx => {
-            await transitionOperation(tx, operation.id, 'ready')
-            await tx.project.update({ where: { id: created.project.id }, data: { status: 'active' } })
-          }))
-        } catch (error) {
-          console.error('Preview worker failed', { operationId: operation.id,
-            stage: error instanceof ImportError ? error.stage : stage,
-            code: error instanceof ImportError ? error.code : 'PREVIEW_WORKER_FAILED' })
-          // A failed preview is never publicly routed; destroy retries removal.
-          if (routed) await tunnel.removePreviewRoute(routed).catch(() => {
-            console.error('Preview route removal failed', { operationId: operation.id, hostname: routed, stage: 'route-remove' })
-          })
-          await recordFailure(operation.id)
-        }
-      })
+      const job = queue.then(() => runWorker(operation, created.project, created.ports, tarball, false))
       const settled = job.catch(() => { unfinished.set(created.project.id, operation.id) }).finally(() => {
-        if (!unfinished.has(created.project.id)) jobs.delete(created.project.id)
+        if (!unfinished.has(created.project.id) && jobs.get(created.project.id) === settled) jobs.delete(created.project.id)
       })
       jobs.set(created.project.id, settled)
       queue = settled
@@ -218,6 +322,10 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       if (destroying.has(operation.projectId)) throw new PreviewConflictError('Destroy already in progress')
       destroying.add(operation.projectId)
       try {
+        // An ensure that passed its own destroying check just before this
+        // one landed is still registering its job; wait it out so teardown
+        // cannot interleave with a provision that is starting (T20).
+        while (ensuring.has(operation.projectId)) await new Promise(resolve => setImmediate(resolve))
         await jobs.get(operation.projectId)
         await settleUnfinished(operation.projectId)
         await reasserting.get(operation.projectId)?.catch(() => undefined)

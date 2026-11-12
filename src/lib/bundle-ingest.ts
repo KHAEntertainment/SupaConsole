@@ -52,7 +52,7 @@
 
 import { promises as fs } from 'fs'
 import * as path from 'path'
-import { randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { Parser, type ReadEntry } from 'tar'
 
 // What we recognize inside the bundle. Anything else is skipped, not rejected:
@@ -980,6 +980,98 @@ export async function ingestBundle(options: IngestBundleOptions): Promise<Ingest
     seedPath: seedEntry ? seedEntry.destPath : null,
     extracted,
   }
+}
+
+// Synthetic root used for the hashing pass. `validateBundle` only does
+// path math (no disk I/O), so any fixed root works; the hash is computed
+// over paths relative to it, which makes the digest independent of where
+// a real ingest would have extracted to.
+const HASH_ROOT = path.resolve('/bundle-content-hash')
+const HASH_IN_TREE_FUNCTIONS_PATH = path.join(HASH_ROOT, 'supabase', 'functions')
+
+// Digest of the bundle's *extracted, validated* contents: the sorted
+// (path, per-file content hash) of every file and symlink the ingest
+// pass would land under the supabase root. Deliberately NOT the raw
+// tarball bytes: tar mtimes (and other header fields) would make
+// byte-identical content hash differently when repacked, and preview
+// re-ensure must treat "same content, new commit metadata" as unchanged.
+// Directories carry no content and modes are stripped deterministically,
+// so neither participates in the digest.
+//
+// The full validation pass runs first, so hashing can never accept an
+// entry the ingest would reject (size caps, traversal, symlink escape,
+// hardlinks, entry-count limits). Bodies are then re-read from the same
+// buffer pairing parser emissions by archive order, exactly like
+// `extractValidated`, and hashed one at a time.
+//
+// A bundle that fails validation (or has no migrations) has no validated
+// contents to hash. Ingest would reject it anyway, so change detection
+// falls back to a domain-separated hash of the raw bytes: an identical
+// retry stays a no-op, and any different bytes re-attempt (and fail)
+// once. The two domains can never collide.
+export async function bundleContentHash(input: Buffer | Uint8Array): Promise<string> {
+  const tarball = asBuffer(input)
+  try {
+    const entries = await validateBundle({
+      tarball,
+      projectDir: HASH_ROOT,
+      functionsMountPath: HASH_IN_TREE_FUNCTIONS_PATH,
+      inTreeFunctionsPath: HASH_IN_TREE_FUNCTIONS_PATH,
+    })
+    return await hashValidatedContents(entries, tarball)
+  } catch (error) {
+    if (error instanceof InvalidBundleError || error instanceof NoMigrationsError) {
+      const raw = createHash('sha256')
+      raw.update('bundle-raw-v1\n')
+      raw.update(tarball)
+      return raw.digest('hex')
+    }
+    throw error
+  }
+}
+
+async function hashValidatedContents(entries: ValidatedEntry[], tarball: Buffer): Promise<string> {
+  const supabaseRoot = path.resolve(HASH_ROOT, 'supabase')
+  const byArchiveIndex = new Map<number, ValidatedEntry>()
+  for (const v of entries) byArchiveIndex.set(v.archiveIndex, v)
+
+  // Same pairing discipline as extractValidated: key by parser-emission
+  // position (not path) so duplicate paths are all seen, and let the last
+  // write win below, matching what extraction leaves on disk.
+  const collected: Array<{ v: ValidatedEntry | null; bodyPromise: Promise<Buffer> }> = []
+  await new Promise<void>((resolve, reject) => {
+    const parser = new Parser({ strict: true })
+    parser.on('entry', (entry: ReadEntry) => {
+      collected.push({ v: byArchiveIndex.get(collected.length) ?? null, bodyPromise: readEntryBody(entry) })
+    })
+    parser.on('end', () => resolve())
+    parser.on('error', (error: Error) => {
+      reject(new InvalidBundleError(`Failed to parse tarball during hashing: ${error.message}`))
+    })
+    parser.end(tarball)
+  })
+
+  const records = new Map<string, { kind: 'file' | 'symlink'; digest: string }>()
+  for (const c of collected) {
+    const body = await c.bodyPromise
+    const v = c.v
+    if (!v) continue
+    // Mode is set only for File and SymbolicLink entries; directories
+    // are mkdir'd implicitly and carry no content to hash.
+    if (v.mode === undefined) continue
+    const key = path.relative(supabaseRoot, v.destPath).split(path.sep).join('/')
+    const isSymlink = v.linkTarget !== undefined
+    const content = isSymlink ? Buffer.from(`symlink\u0000${v.linkTarget}`) : body
+    records.set(key, { kind: isSymlink ? 'symlink' : 'file', digest: createHash('sha256').update(content).digest('hex') })
+  }
+
+  const digest = createHash('sha256')
+  digest.update('bundle-contents-v1\n')
+  for (const key of [...records.keys()].sort()) {
+    const record = records.get(key)!
+    digest.update(`${key}\n${record.kind}\n${record.digest}\n`)
+  }
+  return digest.digest('hex')
 }
 
 // Re-exported for tests: lets test fixtures create tarballs with arbitrary

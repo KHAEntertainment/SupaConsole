@@ -46,7 +46,14 @@ it('returns one operation at a uniqueness latch, queues one provision, persists 
   await service.idle()
   expect(stack.provision).toHaveBeenCalledTimes(1)
   expect(await db.project.count({ where: { repository: 'acme/app', branch: 'latch' } })).toBe(1)
-  expect((await service.ensure(identity('latch'), Buffer.from('replacement'))).id).toBe(a.id)
+  // A changed bundle updates the existing preview under the same project
+  // row (T20): a new operation for the new bundle, still one environment.
+  const updated = await service.ensure(identity('latch'), Buffer.from('replacement'))
+  expect(updated.id).not.toBe(a.id)
+  expect(updated.projectId).toBe(a.projectId)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'latch' } })).toBe(1)
   expect(await service.status('acme/app', a.id)).toEqual({ operationId: a.id, state: 'ready', error: null, url: 'https://preview.example.invalid', anonKey: 'synthetic-anon',
     hostname: `${(await db.project.findUniqueOrThrow({ where: { id: a.projectId } })).slug}.preview.example.invalid` })
   expect(await service.status('other/app', a.id)).toBeNull()
@@ -87,9 +94,127 @@ it('retains failed stacks without exposing diagnostics, then removes them', asyn
   expect(JSON.stringify(status)).not.toContain('secret')
   expect(status).not.toHaveProperty('url')
   expect(stack.destroy).not.toHaveBeenCalled()
-  expect((await service.ensure(identity('broken'), Buffer.from('retry'))).id).toBe(operation.id)
+  // Same-hash retry: stays failed, no retry loop, no new provision (T20).
+  expect((await service.ensure(identity('broken'), Buffer.from('bundle'))).id).toBe(operation.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  // Changed-hash retry (the fix push) re-provisions under the same row.
+  const retry = await service.ensure(identity('broken'), Buffer.from('retry'))
+  expect(retry.id).not.toBe(operation.id)
+  expect(retry.projectId).toBe(operation.projectId)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(await service.status('acme/app', retry.id)).toMatchObject({ state: 'failed' })
+  // Destroy removes the stack the update rebuilt before failing.
   await service.destroy('acme/app', operation.id)
-  expect(stack.destroy).toHaveBeenCalledTimes(1)
+  expect(stack.destroy).toHaveBeenCalledTimes(2)
+})
+
+it('applies a changed bundle to the existing preview and keeps the hostname', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('update'), Buffer.from('update-first'))
+  await service.idle()
+  const before = await service.status('acme/app', first.id)
+  const second = await service.ensure(identity('update'), Buffer.from('update-second'))
+  await service.idle()
+  expect(second.id).not.toBe(first.id)
+  expect(second.projectId).toBe(first.projectId)
+  // The rebuilt environment comes from the second bundle (T20).
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(vi.mocked(stack.provision).mock.calls[1][1]).toEqual(Buffer.from('update-second'))
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'update' } })).toBe(1)
+  const after = await service.status('acme/app', second.id)
+  expect(after).toMatchObject({ state: 'ready' })
+  expect(after?.hostname).toBe(before?.hostname)
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', second.id)
+})
+
+it('leaves the preview untouched when the same bundle is ensured again', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('unchanged'), Buffer.from('unchanged-bundle'))
+  await service.idle()
+  const again = await service.ensure(identity('unchanged'), Buffer.from('unchanged-bundle'))
+  expect(again.id).toBe(first.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  expect(stack.destroy).not.toHaveBeenCalled()
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'unchanged' } })).toBe(1)
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', first.id)
+})
+
+it('keeps one environment and updates the pull request number on re-ensure', async () => {
+  const stack = runtime()
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
+  const first = await service.ensure(identity('pr-meta'), Buffer.from('pr-meta-bundle'))
+  await service.idle()
+  const second = await service.ensure(normalizePreviewIdentity({ repository: 'Acme/App', branch: 'pr-meta', pullRequestNumber: 43 }), Buffer.from('pr-meta-bundle'))
+  expect(second.id).toBe(first.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'pr-meta' } })).toBe(1)
+  expect(await db.project.findUniqueOrThrow({ where: { id: first.projectId } })).toMatchObject({ pullRequestNumber: 43 })
+  await service.destroy('acme/app', first.id)
+})
+
+it('serializes two ensures with different bundles instead of provisioning concurrently', async () => {
+  const stack = runtime()
+  let inFlight = 0
+  let maxInFlight = 0
+  stack.provision = vi.fn(async (_project, _tarball, _ports, persist) => {
+    await persist({ ANON_KEY: 'serial-anon', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+    inFlight++
+    maxInFlight = Math.max(maxInFlight, inFlight)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    inFlight--
+  })
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
+  const first = await service.ensure(identity('serial'), Buffer.from('serial-first'))
+  const second = await service.ensure(identity('serial'), Buffer.from('serial-second'))
+  await service.idle()
+  expect(second.id).not.toBe(first.id)
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(maxInFlight).toBe(1)
+  // The last bundle wins: the second update is what the environment ends on.
+  expect(vi.mocked(stack.provision).mock.calls[1][1]).toEqual(Buffer.from('serial-second'))
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'serial' } })).toBe(1)
+  await service.destroy('acme/app', second.id)
+})
+
+it('ends destroyed with no leftovers when destroy arrives during an update', async () => {
+  const stack = runtime()
+  let release!: () => void
+  const latch = new Promise<void>(resolve => { release = resolve })
+  let updating = false
+  stack.provision = vi.fn(async (_project, _tarball, _ports, persist) => {
+    await persist({ ANON_KEY: 'race-anon', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+    if (updating) await latch
+  })
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('race'), Buffer.from('race-first'))
+  await service.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  updating = true
+  const second = await service.ensure(identity('race'), Buffer.from('race-second'))
+  expect(second.id).not.toBe(first.id)
+  const deletion = service.destroy('acme/app', first.id)
+  // Destroy joins the in-flight update instead of tearing down under it.
+  expect(stack.destroy).not.toHaveBeenCalled()
+  release()
+  expect(await deletion).toBe(true)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  // The update's own teardown, then destroy's teardown of the rebuilt stack.
+  expect(stack.destroy).toHaveBeenCalledTimes(2)
+  expect(vi.mocked(stack.destroy).mock.calls[1][0].id).toBe(first.projectId)
+  expect(tunnel.routes()).toHaveLength(0)
+  expect(await db.project.count({ where: { id: first.projectId } })).toBe(0)
 })
 
 it('recovers queued and provisioning operations on startup and permits destroy', async () => {

@@ -60,6 +60,11 @@ model Project {
   expiryAt DateTime?
   prTitle String?
   prAuthor String?
+  // Content hash of the most recently ensured preview bundle (T20). Null
+  // until a bundle has been accepted for this preview. Used to decide on
+  // re-ensure whether the environment is already current (same hash) or
+  // must be re-provisioned from the new bundle (different hash).
+  bundleHash String?
 
   // Owner
   ownerId     String
