@@ -31,7 +31,25 @@ export function ustarHeader(input: {
   linkname?: string
 }): Buffer {
   const buf = Buffer.alloc(512)
-  buf.write(input.name, 0, 100, 'utf8')
+  // USTAR encodes a long path across the 100-byte `name` and 155-byte
+  // `prefix` fields at a '/' boundary (full path == prefix + '/' + name).
+  // Never truncate: a path with no valid split throws instead of silently
+  // dropping bytes (T20 review R2-5).
+  let name = input.name
+  let prefix = ''
+  if (Buffer.byteLength(name, 'utf8') > 100) {
+    let cut = -1
+    for (let i = name.length - 1; i >= 0; i--) {
+      if (name[i] !== '/') continue
+      const tail = name.slice(i + 1)
+      const head = name.slice(0, i)
+      if (Buffer.byteLength(tail, 'utf8') <= 100 && Buffer.byteLength(head, 'utf8') <= 155) { cut = i; break }
+    }
+    if (cut < 0) throw new Error(`path cannot be encoded as USTAR name+prefix: ${JSON.stringify(name)}`)
+    prefix = name.slice(0, cut)
+    name = name.slice(cut + 1)
+  }
+  buf.write(name, 0, 100, 'utf8')
   buf.write(pad(input.mode ?? 0o644, 8), 100, 8)
   buf.write('0000000', 108, 8)
   buf.write('0000000', 116, 8)
@@ -43,6 +61,7 @@ export function ustarHeader(input: {
   buf.write(input.linkname ?? '', 157, 100, 'utf8')
   buf.write('ustar\0', 257, 6)
   buf.write('00', 263, 2)
+  buf.write(prefix, 345, 155, 'utf8')
   // Compute checksum over the entire header.
   let sum = 0
   for (let i = 0; i < 512; i++) sum += buf[i]

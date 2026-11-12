@@ -710,12 +710,19 @@ describe('bundleContentHash (T20 change detection)', () => {
     const one = buildTarball([migration,
       { name: 'supabase/functions/a', body: content },
       { name: 'supabase/functions/z', body: 'two' }])
-    const two = buildTarball([migration,
-      { name: `supabase/functions/a\nfile\n${digest}\nfunctions/z`, body: 'two' }])
-    // Both are valid bundles; the newline path used to serialize to the
-    // same hash-record preimage as the two-file set.
-    expect((await bundleContentHash(one)).valid).toBe(true)
-    expect((await bundleContentHash(two)).valid).toBe(true)
-    expect((await bundleContentHash(one)).hash).not.toBe((await bundleContentHash(two)).hash)
+    // The attack path is 102 bytes and must survive USTAR name+prefix
+    // encoding intact (R2-5), or the pair is not a real collision fixture.
+    const collisionName = `supabase/functions/a\nfile\n${digest}\nfunctions/z`
+    expect(collisionName.length).toBe(102)
+    const two = buildTarball([migration, { name: collisionName, body: 'two' }])
+    await ingestBundle({ tarball: two, projectDir: projectDir('newline-roundtrip') })
+    expect(await fs.readFile(path.join(projectDir('newline-roundtrip'), collisionName), 'utf8')).toBe('two')
+    // Unambiguous framing: the pair no longer shares a hash-record
+    // preimage. The old newline-joined hash collides on exactly this pair.
+    const hashOf = async (tarball: Buffer) => {
+      const result: unknown = await bundleContentHash(tarball)
+      return typeof result === 'string' ? result : (result as { hash: string }).hash
+    }
+    expect(await hashOf(one)).not.toBe(await hashOf(two))
   })
 })

@@ -102,7 +102,7 @@ export async function recoverInterruptedOperations(
     await tx.project.updateMany({ where: { environmentType: 'preview', OR: [
       { currentOperationId: { in: ids } },
       { currentOperationId: null, operations: { some: {
-        state: 'failed', ...(options.kind !== undefined ? { kind: options.kind } : {}),
+        state: 'failed', id: { in: ids }, ...(options.kind !== undefined ? { kind: options.kind } : {}),
       } } },
     ] }, data: { status: 'failed' } })
     return result.count

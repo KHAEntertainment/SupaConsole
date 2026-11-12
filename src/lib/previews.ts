@@ -62,21 +62,33 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   const claims = new Map<string, Promise<unknown>>()
   const reasserting = new Map<string, Promise<void>>()
   // Interrupted operations whose tunnel route could not be removed yet
-  // (operationId -> slug). They stay non-terminal so cleanup is retryable.
+  // (operationId -> projectId). They stay non-terminal so cleanup is retryable.
   const pendingRoutes = new Map<string, string>()
   // Remove each interrupted preview's route before its operation is marked
-  // failed; returns the operation ids whose route is gone (or never possible).
+  // failed; returns the operation ids whose cleanup is done (route gone,
+  // never possible, or not theirs to remove). Ownership is re-checked on
+  // every attempt (T20 review R2-3): the hostname is per project, so a
+  // superseded attempt must never remove the route its project's current
+  // owner is serving on. Only the current attempt, or a legacy row without
+  // a recorded owner, is cleaned up; route removal still happens before the
+  // attempt is marked failed, and a failed removal stays retryable.
   async function clearInterruptedRoutes(entries: Array<[string, string]>): Promise<string[]> {
     const cleared: string[] = []
-    for (const [operationId, slug] of entries) {
+    for (const [operationId, projectId] of entries) {
+      const project = await db.project.findUnique({ where: { id: projectId }, select: { slug: true, currentOperationId: true } })
+      if (!project || (project.currentOperationId !== null && project.currentOperationId !== operationId)) {
+        pendingRoutes.delete(operationId)
+        cleared.push(operationId)
+        continue
+      }
       let hostname: string
-      try { hostname = previewHostname(slug, domain) } catch { pendingRoutes.delete(operationId); cleared.push(operationId); continue }
+      try { hostname = previewHostname(project.slug, domain) } catch { pendingRoutes.delete(operationId); cleared.push(operationId); continue }
       try {
         await tunnel.removePreviewRoute(hostname)
         pendingRoutes.delete(operationId)
         cleared.push(operationId)
       } catch {
-        pendingRoutes.set(operationId, slug)
+        pendingRoutes.set(operationId, projectId)
         console.error('Preview route removal failed', { operationId, hostname, stage: 'route-remove-recovery' })
       }
     }
@@ -84,8 +96,8 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   }
   async function recover(): Promise<number> {
     const interrupted = await db.operation.findMany({ where: { kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } },
-      include: { project: { select: { slug: true } } } })
-    const cleared = await clearInterruptedRoutes(interrupted.map(operation => [operation.id, operation.project.slug]))
+      include: { project: { select: { id: true } } } })
+    const cleared = await clearInterruptedRoutes(interrupted.map(operation => [operation.id, operation.project.id]))
     return recoverInterruptedOperations(db, { kind: PREVIEW_OPERATION_KIND, ids: cleared })
   }
   async function retryPendingRoutes() {
@@ -118,27 +130,41 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   async function settleUnfinished(projectId: string) {
     const pending = unfinished.get(projectId)
     if (!pending) return
-    for (const operationId of [...pending]) await recordFailure(operationId)
-    unfinished.delete(projectId)
-    // Delete only this settlement's own job entry; a newer attempt's job
-    // must stay tracked for destroy (T20 review finding 2).
-    const tracked = jobs.get(projectId)
-    if (tracked && pending.has(tracked.operationId)) jobs.delete(projectId)
+    // Drain the live Set one id at a time (T20 review R2-1): a failure
+    // appended while we await must be settled too, and only the ids
+    // actually settled leave the Set. Deleting the whole entry here would
+    // strand the newcomer and clear its job tracking with it.
+    while (pending.size > 0) {
+      const operationId = pending.values().next().value as string
+      await recordFailure(operationId)
+      pending.delete(operationId)
+      // Delete only the settled operation's own job entry; a newer
+      // attempt's job must stay tracked for destroy (T20 review finding 2).
+      const tracked = jobs.get(projectId)
+      if (tracked && tracked.operationId === operationId) jobs.delete(projectId)
+    }
+    if (unfinished.get(projectId) === pending) unfinished.delete(projectId)
   }
   async function existing(identity: PreviewIdentity) {
     const project = await db.project.findUnique({ where: { repository_branch: { repository: identity.repository, branch: identity.branch } },
       include: { operations: { where: { kind: PREVIEW_OPERATION_KIND }, orderBy: { createdAt: 'desc' }, take: 3 } } })
     if (!project) return null
-    if (project.environmentType !== 'preview' || !project.operations[0]) throw new PreviewConflictError('Identity belongs to a different environment')
-    // The operation that currently owns the environment: the claim recorded
-    // it atomically with the bundle hash (T20 review finding 6), so an older
-    // unsettled attempt can never be picked as current. Rows without a
-    // recorded owner fall back to the newest attempt.
-    const operation = (project.currentOperationId !== null
-      ? project.operations.find(candidate => candidate.id === project.currentOperationId) ?? null
-      : null)
-      ?? project.operations.find(candidate => candidate.state === 'queued' || candidate.state === 'provisioning')
-      ?? project.operations[0]
+    if (project.environmentType !== 'preview') throw new PreviewConflictError('Identity belongs to a different environment')
+    // The recorded owner is authoritative and resolved by id (T20 review
+    // R2-2): rejected or superseded attempts can push it out of any
+    // recent-history window, and a recorded owner is never silently
+    // substituted by another attempt. Only rows without a recorded owner
+    // (pre-claim legacy data) fall back to the newest attempt.
+    let operation: Operation | null = null
+    if (project.currentOperationId !== null) {
+      operation = await db.operation.findFirst({ where: { id: project.currentOperationId,
+        projectId: project.id, kind: PREVIEW_OPERATION_KIND } })
+      if (!operation) throw new PreviewConflictError('Current operation record is missing')
+    } else {
+      operation = project.operations.find(candidate => candidate.state === 'queued' || candidate.state === 'provisioning')
+        ?? project.operations[0] ?? null
+      if (!operation) throw new PreviewConflictError('Identity belongs to a different environment')
+    }
     if (unfinished.has(project.id)) {
       await settleUnfinished(project.id)
       return { project, operation: await db.operation.findUniqueOrThrow({ where: { id: operation.id } }) }
@@ -325,9 +351,22 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
       // A bundle with no validated contents (T20 review finding 9): ingest
       // would reject it, so it must never claim a rebuild or tear down a
       // running preview. Record the failed attempt instead; the live stack,
-      // route and the recorded bundleHash stay untouched.
+      // route and the recorded bundleHash stay untouched. A failed
+      // replacement never becomes the owner and never writes project status.
+      // Retries of the same invalid bytes resolve to the same failed
+      // operation (T20 review R2-6): the rejected digest is recorded on the
+      // attempt, so identical retries never append history.
+      const rejected = await db.operation.findFirst({ where: { projectId: project.id,
+        kind: PREVIEW_OPERATION_KIND, state: 'failed', bundleHash: bundle.hash },
+        orderBy: { createdAt: 'desc' } })
+      if (rejected) {
+        if (Object.keys(patch).length > 0) {
+          await retryWrite(() => db.project.update({ where: { id: project.id }, data: patch }))
+        }
+        return rejected
+      }
       const failure = await retryWrite(() => db.$transaction(async tx => {
-        const created = await tx.operation.create({ data: { projectId: project.id, kind: PREVIEW_OPERATION_KIND } })
+        const created = await tx.operation.create({ data: { projectId: project.id, kind: PREVIEW_OPERATION_KIND, bundleHash: bundle.hash } })
         if (Object.keys(patch).length > 0) await tx.project.update({ where: { id: project.id }, data: patch })
         return created
       }))

@@ -40,9 +40,14 @@ function gatedDb(gate: {
   findUnique?: (args: unknown) => Promise<void>
   findMany?: (args: unknown) => Promise<void>
   beforeProjectDelete?: () => Promise<void>
+  transaction?: (run: () => Promise<unknown>) => Promise<unknown>
 }): PrismaClient {
   return new Proxy(db, {
     get(target, prop) {
+      if (prop === '$transaction') {
+        const base = (Reflect.get(target, prop, target) as (...args: unknown[]) => Promise<unknown>).bind(target)
+        return (...args: unknown[]) => (gate.transaction ? gate.transaction(() => base(...args)) : base(...args))
+      }
       if (prop === 'project' || prop === 'projectEnvVar') {
         const delegate = Reflect.get(target, prop, target) as object
         return new Proxy(delegate, {
@@ -370,13 +375,17 @@ it('destroy waits for every registering update and leaves nothing behind (T20 re
   const tunnel = fakeTunnel()
   const bundleA = bundle('alter table a;')
   const bundleB = bundle('alter table b;')
-  // Seam: stall each update's ports lookup mid-registration (accepted,
-  // job not yet registered).
+  // Seam: hold BOTH updates at their ports lookup (accepted, job not yet
+  // registered). The old shared-Set code lets A's cleanup drop B's
+  // ownership while B is still registering; the fixed code gives each
+  // registration its own token and serializes claims.
   const portsA = latch(); const gateA = latch()
   const portsB = latch(); const gateB = latch()
-  let reads = 0
-  // Seam: hold destroy at its row deletion until the end.
+  // Seam: hold destroy at its row deletion - after its job-map snapshot
+  // and its teardown - until the test releases it.
   const deleteEntered = latch(); const deleteGate = latch()
+  let reads = 0; let deleteSeen = false
+  deleteEntered.promise.then(() => { deleteSeen = true })
   const service = createPreviewService(gatedDb({
     findMany: async () => {
       const read = ++reads
@@ -391,30 +400,52 @@ it('destroy waits for every registering update and leaves nothing behind (T20 re
   const enteredB = latch(); const finishB = latch()
   stack.provision = vi.fn(async (_project, tarball, _ports, persist) => {
     await persist({ ANON_KEY: 'synthetic', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
-    await fs.writeFile(marker, 'provisioned')
     if (tarball.equals(bundleB)) { enteredB.release(); await finishB.promise }
+    await fs.writeFile(marker, 'provisioned')
   })
   stack.destroy = vi.fn(async () => { await fs.rm(marker, { force: true }) })
   const updateA = service.ensure(identity('set-race'), bundleA)
   const updateB = service.ensure(identity('set-race'), bundleB)
   await portsA.promise
+  // Which schedule is live? The old shared-Set code registers both updates
+  // concurrently (B reaches its ports lookup while A is held); the fixed
+  // code serializes claims, so B cannot start registering until A's
+  // registration finishes. Bounded real DB awaits decide; no timing sleep.
+  let concurrent = false
+  portsB.promise.then(() => { concurrent = true })
+  for (let i = 0; i < 100 && !concurrent; i++) await db.operation.count()
   gateA.release()
   await updateA
-  await portsB.promise
-  // B is accepted and mid-registration (53c1fac: A's cleanup already
-  // dropped B's ownership of the shared Set entry).
-  const deletion = service.destroy('acme/app', first.id)
-  gateB.release()
-  await updateB
-  await enteredB.promise
-  finishB.release()
-  await service.idle()
-  await deleteEntered.promise
-  // Destroy must have joined the surviving update: the marker its provision
-  // wrote is gone. (53c1fac: destroy never waits and the marker survives.)
-  expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
-  deleteGate.release()
-  expect(await deletion).toBe(true)
+  if (concurrent) {
+    // Old schedule, forced: A's cleanup dropped B's shared Set entry while
+    // B is still registering, so destroy snapshots no job for B at all.
+    const deletion = service.destroy('acme/app', first.id)
+    for (let i = 0; i < 100 && !deleteSeen; i++) await db.operation.count()
+    gateB.release()
+    await updateB
+    await enteredB.promise
+    finishB.release()
+    await service.idle()
+    await deleteEntered.promise
+    // Destroy tore down before B provisioned, so B's marker outlives the
+    // deleted row - the leftover the token fix prevents.
+    expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+    deleteGate.release()
+    expect(await deletion).toBe(true)
+  } else {
+    // Fixed schedule: registrations serialize and destroy waits out B's.
+    await portsB.promise
+    const deletion = service.destroy('acme/app', first.id)
+    gateB.release()
+    await updateB
+    await enteredB.promise
+    finishB.release()
+    await service.idle()
+    await deleteEntered.promise
+    expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+    deleteGate.release()
+    expect(await deletion).toBe(true)
+  }
   expect(await db.project.findUnique({ where: { id: first.projectId } })).toBeNull()
 })
 
@@ -422,15 +453,10 @@ it('settling an older failed attempt keeps the newer job tracked for destroy (T2
   const bundleA = bundle('alter table a;')
   const bundleB = bundle('alter table b;')
   const failA = latch(); const enteredA = latch(); const enteredB = latch(); const finishB = latch()
+  const deleteEntered = latch(); const deleteGate = latch()
+  let deleteSeen = false; let injectFailure = false
+  deleteEntered.promise.then(() => { deleteSeen = true })
   const marker = path.join(directory, 'unfinished-survivor')
-  let injectFailure = false
-  const wrapped = new Proxy(db, { get(target, prop) {
-    if (prop === '$transaction') return (...args: unknown[]) => {
-      if (injectFailure) { injectFailure = false; return Promise.reject(new Error('failure settlement unavailable')) }
-      return (target.$transaction as (...values: unknown[]) => Promise<unknown>)(...args)
-    }
-    return Reflect.get(target, prop, target)
-  } }) as PrismaClient
   const stack: PreviewRuntime = {
     provision: vi.fn(async (_p, tarball, _ports, persist) => {
       if (tarball.equals(bundleA)) { enteredA.release(); await failA.promise; injectFailure = true; throw new Error('import failed') }
@@ -440,22 +466,36 @@ it('settling an older failed attempt keeps the newer job tracked for destroy (T2
     }),
     destroy: vi.fn(async () => { await fs.rm(marker, { force: true }) }),
   }
-  const service = createPreviewService(wrapped, stack, { tunnel: fakeTunnel() })
+  const service = createPreviewService(gatedDb({
+    transaction: async run => {
+      if (injectFailure) { injectFailure = false; throw new Error('failure settlement unavailable') }
+      return run()
+    },
+    beforeProjectDelete: async () => { deleteEntered.release(); await deleteGate.promise },
+  }), stack, { tunnel: fakeTunnel() })
   const a = await service.ensure(identity('unfinished-race'), bundleA)
   await enteredA.promise
   await service.ensure(identity('unfinished-race'), bundleB)
   failA.release()
   await enteredB.promise
   expect((await db.operation.findUniqueOrThrow({ where: { id: a.id } })).state).toBe('provisioning')
+  // Settling A must not drop B's tracked job.
   expect(await service.status('acme/app', a.id)).toMatchObject({ state: 'failed' })
   const deletion = service.destroy('acme/app', a.id)
+  // Destroy either waits B's job (fixed) or - once its job-map snapshot
+  // missed it - proceeds to the row-delete seam (old). B is only released
+  // after destroy is at that seam or waiting on B itself.
+  for (let i = 0; i < 100 && !deleteSeen; i++) await db.operation.count()
   finishB.release()
-  expect(await deletion).toBe(true)
   await service.idle()
-  expect(await db.project.findUnique({ where: { id: a.projectId } })).toBeNull()
-  // The surviving update's marker must be gone. (53c1fac: settleUnfinished
-  // dropped B's job from destroy tracking and the marker outlives the row.)
+  await deleteEntered.promise
+  // Destroy joined the surviving update: B's marker is gone. (53c1fac:
+  // settleUnfinished dropped B's job unconditionally, destroy never waited,
+  // and the marker outlives the deleted row.)
   expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+  deleteGate.release()
+  expect(await deletion).toBe(true)
+  expect(await db.project.findUnique({ where: { id: a.projectId } })).toBeNull()
 })
 
 it('an old ready operation exposes no credentials while its replacement is unready or failed (T20 review 3)', async () => {
@@ -685,4 +725,114 @@ it('a pre-upgrade preview with no recorded hash rebuilds exactly once (T20 P3)',
   await service.idle()
   expect(stack.provision).toHaveBeenCalledTimes(2)
   await service.destroy('acme/app', rebuilt.id)
+})
+
+it('settles a failure appended while settlement is running (T20 review R2-1)', async () => {
+  const aBundle = bundle('alter table a;')
+  const bBundle = bundle('alter table b;')
+  const enteredA = latch(); const failA = latch(); const enteredB = latch(); const failB = latch()
+  const settleEntered = latch(); const settleGate = latch()
+  let rejectNext = false; let gateNext = false
+  const service = createPreviewService(gatedDb({ transaction: async run => {
+    if (rejectNext) { rejectNext = false; throw new Error('settlement write unavailable') }
+    if (gateNext) { gateNext = false; settleEntered.release(); await settleGate.promise }
+    return run()
+  } }), {
+    provision: vi.fn(async (_p, tarball) => {
+      if (tarball.equals(aBundle)) { enteredA.release(); await failA.promise }
+      else { enteredB.release(); await failB.promise }
+      rejectNext = true
+      throw new Error('import failed')
+    }),
+    destroy: vi.fn(async () => {}),
+  }, { tunnel: fakeTunnel() })
+  const a = await service.ensure(identity('unfinished-mutation'), aBundle)
+  await enteredA.promise
+  const b = await service.ensure(identity('unfinished-mutation'), bBundle)
+  failA.release()
+  await enteredB.promise
+  gateNext = true
+  const settle = service.status('acme/app', a.id)
+  await settleEntered.promise
+  // B's failure lands while A's settlement write is in flight.
+  failB.release()
+  await service.idle()
+  settleGate.release()
+  await settle
+  // The settlement must drain B's failure too (82c1f86: B is discarded
+  // mid-settlement and stays 'provisioning' with destroy rejected).
+  expect((await db.operation.findUniqueOrThrow({ where: { id: b.id } })).state).toBe('failed')
+  expect(await service.status('acme/app', b.id)).toMatchObject({ state: 'failed' })
+  expect(await service.destroy('acme/app', a.id)).toBe(true)
+})
+
+it('rejected replacements cannot evict the owner from lookup (T20 review R2-2)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const valid = bundle('select 1;')
+  const first = await service.ensure(identity('owner-window'), valid)
+  await service.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  // Three distinct rejected replacements: each records a failed attempt.
+  for (let n = 0; n < 3; n++) {
+    const rejected = await service.ensure(identity('owner-window'), Buffer.from(`invalid-${n}`))
+    expect(await service.status('acme/app', rejected.id)).toMatchObject({ state: 'failed' })
+  }
+  const host = tunnel.routes()[0].hostname!
+  await tunnel.removePreviewRoute(host)
+  // The unchanged valid bundle must resolve to the recorded owner and
+  // restore its route (82c1f86: returns a rejected failed id and leaves
+  // the route lost).
+  const again = await service.ensure(identity('owner-window'), valid)
+  expect(again.id).toBe(first.id)
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(tunnel.routes()[0].hostname).toBe(host)
+  await service.destroy('acme/app', first.id)
+})
+
+it('startup recovery keeps the current owner route (T20 review R2-3)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const firstService = createPreviewService(db, stack, { tunnel })
+  const current = await firstService.ensure(identity('recovery-route'), bundle('select 1;'))
+  await firstService.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  const host = tunnel.routes()[0].hostname!
+  // An older attempt of the same project is stuck from a previous life.
+  await db.operation.create({ data: { id: 'old-unsettled', projectId: current.projectId,
+    kind: PREVIEW_OPERATION_KIND, state: 'provisioning', createdAt: new Date(0) } })
+  const restarted = createPreviewService(db, stack, { tunnel })
+  expect(await restarted.start()).toBe(1)
+  // The interrupted attempt settles without touching the route its
+  // project's owner is serving on (82c1f86: removes the route while
+  // keeping the project active and the owner ready).
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(tunnel.routes()[0].hostname).toBe(host)
+  expect(await db.operation.findUniqueOrThrow({ where: { id: 'old-unsettled' } })).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
+  expect((await db.project.findUniqueOrThrow({ where: { id: current.projectId } })).status).toBe('active')
+  expect(await restarted.status('acme/app', current.id)).toMatchObject({ state: 'ready', hostname: host })
+  await restarted.destroy('acme/app', current.id)
+})
+
+it('dedupes repeated identical invalid replacements (T20 review R2-6)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('dedupe'), bundle('select 1;'))
+  await service.idle()
+  const bad = Buffer.from('bad-bytes')
+  const rejected = await service.ensure(identity('dedupe'), bad)
+  const again = await service.ensure(identity('dedupe'), bad)
+  // Identical retries resolve to the same failed operation: no new
+  // history, no ownership change, no status change.
+  // (82c1f86: a fresh failed row per retry.)
+  expect(again.id).toBe(rejected.id)
+  expect(await service.status('acme/app', again.id)).toMatchObject({ state: 'failed' })
+  expect(await db.operation.count({ where: { projectId: first.projectId, kind: PREVIEW_OPERATION_KIND } })).toBe(2)
+  const project = await db.project.findUniqueOrThrow({ where: { id: first.projectId } })
+  expect(project.currentOperationId).toBe(first.id)
+  expect(project.status).toBe('active')
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', first.id)
 })
