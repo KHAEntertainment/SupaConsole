@@ -836,3 +836,68 @@ it('dedupes repeated identical invalid replacements (T20 review R2-6)', async ()
   expect(tunnel.routes()).toHaveLength(1)
   await service.destroy('acme/app', first.id)
 })
+
+it('a pending cleanup retry cannot remove a newer owner route (T20 review R3-1)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  // Owner A is an interrupted attempt whose route cleanup is pending.
+  const owner = await db.user.upsert({ where: { email: PREVIEW_OWNER_EMAIL }, update: {},
+    create: { email: PREVIEW_OWNER_EMAIL, name: 'Preview service', password: '!disabled-preview-service' } })
+  const project = await db.project.create({ data: { ...identity('stale-cleanup'), name: 'stale', slug: 'stale-cleanup',
+    ownerId: owner.id, environmentType: 'preview', status: 'provisioning', currentOperationId: 'op-a',
+    operations: { create: { id: 'op-a', kind: PREVIEW_OPERATION_KIND, state: 'provisioning' } } } })
+  await db.projectEnvVar.create({ data: { projectId: project.id, key: 'API_GW_HTTP_PORT', value: '23456' } })
+  const host = previewHostname(project.slug, tunnel.domain)
+  await tunnel.addPreviewRoute(host, 'http://127.0.0.1:9')
+  // First recovery removal fails: A stays non-terminal and retryable.
+  vi.spyOn(tunnel, 'removePreviewRoute').mockImplementationOnce(async () => { throw new Error('tunnel unavailable') })
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  // Seam: pause a cleanup retry after its ownership read, before removal.
+  const arm = { value: false }; const captured = latch(); const resume = latch()
+  let paused = false
+  const service = createPreviewService(gatedDb({ findUnique: async (args) => {
+    const request = args as { where?: { id?: unknown }; select?: unknown }
+    if (arm.value && !paused && request?.where?.id === project.id && request.select) {
+      paused = true; captured.release(); await resume.promise
+    }
+  } }), stack, { tunnel })
+  expect(await service.start()).toBe(0)
+  expect((await db.operation.findUniqueOrThrow({ where: { id: 'op-a' } })).state).toBe('provisioning')
+  expect(tunnel.routes()).toHaveLength(1)
+  arm.value = true
+  const retry = service.start() // retry #1: ownership read captured, paused
+  await captured.promise
+  // Retry #2 and an ensure try to finish B while retry #1 is paused.
+  const claim = service.ensure(identity('stale-cleanup'), bundle('alter table b;'))
+  let claimed = false
+  claim.then(() => { claimed = true }, () => { claimed = true })
+  for (let i = 0; i < 100 && !claimed; i++) await db.operation.count()
+  let bOp: { id: string }
+  if (claimed) {
+    // Old schedule: the claim ran while retry #1 held a stale owner read.
+    bOp = await claim
+    await service.idle()
+    expect(tunnel.routes()).toHaveLength(1) // B is routed (sanity)
+    resume.release()
+    await retry
+    // The stale retry must not remove B's fresh route.
+    expect(tunnel.routes()).toHaveLength(1) // fails on b485108: route gone
+  } else {
+    // Fixed schedule: retry #1 holds the claim lock, so the claim waits.
+    resume.release()
+    await retry
+    bOp = await claim
+    await service.idle()
+    expect(tunnel.routes()).toHaveLength(1)
+  }
+  // Both schedules end with B owning the project, reachable and ready on
+  // the unchanged hostname.
+  const status = await service.status('acme/app', bOp.id)
+  expect(status).toMatchObject({ state: 'ready', hostname: host })
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(tunnel.routes()[0].hostname).toBe(host)
+  expect((await db.operation.findUniqueOrThrow({ where: { id: 'op-a' } })).state).toBe('failed')
+  expect((await db.project.findUniqueOrThrow({ where: { id: project.id } })).currentOperationId).toBe(bOp.id)
+  await service.destroy('acme/app', bOp.id)
+  vi.restoreAllMocks()
+})

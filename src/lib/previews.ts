@@ -14,6 +14,13 @@ export const PREVIEW_OPERATION_KIND = 'preview-ensure'
 
 export class PreviewConflictError extends Error {}
 
+// A pending route-cleanup target (T20 review R3-1): the project to inspect
+// and the claim key its immutable identity maps to.
+interface RouteCleanup {
+  projectId: string
+  claimKey: string | null
+}
+
 // The slice of the tunnel adapter the worker drives; tests inject a stub.
 export type PreviewTunnel = Pick<CloudflareTunnel, 'domain' | 'addPreviewRoute' | 'removePreviewRoute'>
 
@@ -62,8 +69,10 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   const claims = new Map<string, Promise<unknown>>()
   const reasserting = new Map<string, Promise<void>>()
   // Interrupted operations whose tunnel route could not be removed yet
-  // (operationId -> projectId). They stay non-terminal so cleanup is retryable.
-  const pendingRoutes = new Map<string, string>()
+  // (operationId -> cleanup target: the project and the claim key derived
+  // from its immutable identity). They stay non-terminal so cleanup is
+  // retryable.
+  const pendingRoutes = new Map<string, RouteCleanup>()
   // Remove each interrupted preview's route before its operation is marked
   // failed; returns the operation ids whose cleanup is done (route gone,
   // never possible, or not theirs to remove). Ownership is re-checked on
@@ -72,32 +81,53 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
   // owner is serving on. Only the current attempt, or a legacy row without
   // a recorded owner, is cleaned up; route removal still happens before the
   // attempt is marked failed, and a failed removal stays retryable.
-  async function clearInterruptedRoutes(entries: Array<[string, string]>): Promise<string[]> {
+  //
+  // The ownership re-read and the tunnel removal are ONE step under the
+  // project's claim lock (T20 review R3-1) - the same lock that serializes
+  // claims and same-hash re-asserts - so no newer owner can be installed
+  // between the check and the removal and a stale retry can never remove a
+  // fresh route. Lock order (no cycles): the claim lock is only held across
+  // one DB read and one tunnel removal call (both bounded) and is never
+  // nested - `start()`/`retryPendingRoutes` finish before any claim begins,
+  // `reassertRoute`, `startUpdate` and `settleUnfinished` take no locks
+  // inside a claim, and `destroy` never holds the claim lock (it only meets
+  // this sweep through `start()`, as before). A removal failure releases
+  // the lock and keeps the entry for the next retry.
+  async function clearInterruptedRoutes(entries: Array<[string, RouteCleanup]>): Promise<string[]> {
     const cleared: string[] = []
-    for (const [operationId, projectId] of entries) {
-      const project = await db.project.findUnique({ where: { id: projectId }, select: { slug: true, currentOperationId: true } })
-      if (!project || (project.currentOperationId !== null && project.currentOperationId !== operationId)) {
-        pendingRoutes.delete(operationId)
-        cleared.push(operationId)
-        continue
+    for (const [operationId, cleanup] of entries) {
+      const attempt = async () => {
+        const project = await db.project.findUnique({ where: { id: cleanup.projectId }, select: { slug: true, currentOperationId: true } })
+        if (!project || (project.currentOperationId !== null && project.currentOperationId !== operationId)) {
+          pendingRoutes.delete(operationId)
+          cleared.push(operationId)
+          return
+        }
+        let hostname: string
+        try { hostname = previewHostname(project.slug, domain) } catch { pendingRoutes.delete(operationId); cleared.push(operationId); return }
+        try {
+          await tunnel.removePreviewRoute(hostname)
+          pendingRoutes.delete(operationId)
+          cleared.push(operationId)
+        } catch {
+          pendingRoutes.set(operationId, cleanup)
+          console.error('Preview route removal failed', { operationId, hostname, stage: 'route-remove-recovery' })
+        }
       }
-      let hostname: string
-      try { hostname = previewHostname(project.slug, domain) } catch { pendingRoutes.delete(operationId); cleared.push(operationId); continue }
-      try {
-        await tunnel.removePreviewRoute(hostname)
-        pendingRoutes.delete(operationId)
-        cleared.push(operationId)
-      } catch {
-        pendingRoutes.set(operationId, projectId)
-        console.error('Preview route removal failed', { operationId, hostname, stage: 'route-remove-recovery' })
-      }
+      // A row without a stored identity cannot be claimed by any ensure
+      // (existing() only matches repository + branch), so it needs no lock.
+      if (cleanup.claimKey === null) await attempt()
+      else await claimLock(cleanup.claimKey, attempt)
     }
     return cleared
   }
   async function recover(): Promise<number> {
     const interrupted = await db.operation.findMany({ where: { kind: PREVIEW_OPERATION_KIND, state: { in: ['queued', 'provisioning'] } },
-      include: { project: { select: { id: true } } } })
-    const cleared = await clearInterruptedRoutes(interrupted.map(operation => [operation.id, operation.project.id]))
+      include: { project: { select: { id: true, repository: true, branch: true } } } })
+    const cleared = await clearInterruptedRoutes(interrupted.map(operation => [operation.id, {
+      projectId: operation.project.id,
+      claimKey: claimKeyFor(operation.project.repository, operation.project.branch),
+    }]))
     return recoverInterruptedOperations(db, { kind: PREVIEW_OPERATION_KIND, ids: cleared })
   }
   async function retryPendingRoutes() {
@@ -190,6 +220,12 @@ export function createPreviewService(db: PrismaClient, runtime: PreviewRuntime, 
     return ports
   }
   function claimKey(identity: PreviewIdentity) { return `${identity.repository}\u0000${identity.branch}` }
+  // The claim key of a project row: repository/branch are immutable and
+  // stored normalized, so this matches claimKey(identity) for that preview
+  // (T20 review R3-1). Null when the row has no stored identity.
+  function claimKeyFor(repository: string | null, branch: string | null): string | null {
+    return repository !== null && branch !== null ? `${repository}\u0000${branch}` : null
+  }
   // Serialize the re-read -> compare -> claim critical section per preview
   // (T20 review finding 5). The create path stays outside: its uniqueness
   // latch is the serialization there.
