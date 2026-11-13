@@ -78,22 +78,33 @@ export async function recoverInterruptedOperations(
   // `ids` narrows recovery to operations whose external cleanup (e.g. tunnel
   // route removal) already succeeded; the rest stay recoverable on a retry.
   return db.$transaction(async tx => {
-    const result = await tx.operation.updateMany({
+    const interrupted = await tx.operation.findMany({
       where: {
         state: { in: ['queued', 'provisioning'] },
         ...(options.kind !== undefined ? { kind: options.kind } : {}),
         ...(options.ids !== undefined ? { id: { in: options.ids } } : {}),
       },
+      select: { id: true },
+    })
+    const ids = interrupted.map(row => row.id)
+    const result = await tx.operation.updateMany({
+      where: { id: { in: ids } },
       data: {
         state: 'failed',
         finishedAt: new Date(),
         error: 'interrupted by restart',
       },
     })
-    await tx.project.updateMany({ where: { environmentType: 'preview', operations: { some: {
-      state: 'failed', ...(options.kind !== undefined ? { kind: options.kind } : {}),
-      ...(options.ids !== undefined ? { id: { in: options.ids } } : {}),
-    } } }, data: { status: 'failed' } })
+    // Project status follows only a recovered attempt that owned the project
+    // (T20): a project whose current operation moved on must not be marked
+    // failed by an older attempt's recovery. Rows without a recorded owner
+    // keep the legacy rule.
+    await tx.project.updateMany({ where: { environmentType: 'preview', OR: [
+      { currentOperationId: { in: ids } },
+      { currentOperationId: null, operations: { some: {
+        state: 'failed', id: { in: ids }, ...(options.kind !== undefined ? { kind: options.kind } : {}),
+      } } },
+    ] }, data: { status: 'failed' } })
     return result.count
   })
 }

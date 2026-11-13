@@ -88,6 +88,11 @@ describe('preview state-machine migration', () => {
       { cwd: root, input: LEGACY_ROWS_SQL, encoding: 'utf8', timeout: 60000 }
     )
     applySql(upgradedUrl, path.join(migrationDir, 'migration.sql'))
+    // Later migrations that add columns the generated client selects (T20's
+    // projects.bundleHash) must also be applied here, or client queries see
+    // a column the fixture lacks; the down path below reverses them in
+    // reverse order before its pre-T12 comparison.
+    applySql(upgradedUrl, path.join(root, 'prisma', 'migrations', '20261112120000_project_bundle_hash', 'migration.sql'))
   })
 
   it('drops the superseded pull-request identity rule and keeps project rows', async () => {
@@ -144,6 +149,8 @@ describe('preview state-machine migration', () => {
 
 describe('down path', () => {
   beforeAll(() => {
+    // Reverse later migrations first (newest down before older down).
+    applySql(upgradedUrl, path.join(root, 'prisma', 'migrations', '20261112120000_project_bundle_hash', 'down.sql'))
     applySql(upgradedUrl, path.join(migrationDir, 'down.sql'))
   })
 

@@ -60,6 +60,17 @@ model Project {
   expiryAt DateTime?
   prTitle String?
   prAuthor String?
+  // Content hash of the most recently ensured preview bundle (T20). Null
+  // until a bundle has been accepted for this preview. Used to decide on
+  // re-ensure whether the environment is already current (same hash) or
+  // must be re-provisioned from the new bundle (different hash).
+  bundleHash String?
+  // The operation that currently owns this preview's environment (T20).
+  // Written atomically with the claim that sets bundleHash; only this
+  // attempt may write project status, and same-hash lookups return it.
+  // Null on rows that predate the claim (e.g. restored/backfilled data),
+  // where callers fall back to the newest operation.
+  currentOperationId String?
 
   // Owner
   ownerId     String
@@ -126,6 +137,10 @@ model Operation {
   projectId String
   kind String
   state String @default("queued")
+  // Recorded only for validation-rejected replacement attempts (T20): the
+  // rejected bundle's digest, so an identical retry returns the existing
+  // failed operation instead of appending history.
+  bundleHash String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   startedAt DateTime?

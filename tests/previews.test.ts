@@ -5,13 +5,14 @@ import path from 'node:path'
 import { PrismaClient } from '@prisma/client'
 import { NextRequest, NextResponse } from 'next/server'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
-import { createPreviewService, PREVIEW_OWNER_EMAIL } from '@/lib/previews'
+import { createPreviewService, PREVIEW_OWNER_EMAIL, PREVIEW_OPERATION_KIND } from '@/lib/previews'
 import { previewHostname } from '@/lib/tunnel'
 import { createPreviewRoutes } from '@/lib/preview-routes'
 import { normalizePreviewIdentity } from '@/lib/preview-identity'
 import { verifyPassword } from '@/lib/auth'
 import type { PreviewRuntime } from '@/lib/preview-runtime'
 import { fakeTunnel } from './helpers/fake-tunnel'
+import { buildTarball } from './helpers/build-tar'
 
 let directory: string
 let db: PrismaClient
@@ -26,6 +27,54 @@ afterAll(async () => {
   await fs.rm(directory, { recursive: true, force: true })
 })
 function identity(branch: string) { return normalizePreviewIdentity({ repository: 'Acme/App', branch, pullRequestNumber: 42 }) }
+// Valid bundles for anything that must take the update path: an update claim
+// requires validated content (T20 review 9), so successful updates never use
+// garbage-byte fixtures.
+function bundle(sql: string) { return buildTarball([{ name: 'supabase/migrations/0001_change.sql', body: sql }]) }
+function latch() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve }); return { promise, release } }
+// Wrap a Prisma client so delegate calls can be gated mid-flight. Used
+// instead of vi.spyOn on Prisma delegates (spy restore on them is
+// unreliable and leaks recursion); the gated client is passed to one
+// service only, so nothing carries into other tests.
+function gatedDb(gate: {
+  findUnique?: (args: unknown) => Promise<void>
+  findMany?: (args: unknown) => Promise<void>
+  beforeProjectDelete?: () => Promise<void>
+  transaction?: (run: () => Promise<unknown>) => Promise<unknown>
+}): PrismaClient {
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop === '$transaction') {
+        const base = (Reflect.get(target, prop, target) as (...args: unknown[]) => Promise<unknown>).bind(target)
+        return (...args: unknown[]) => (gate.transaction ? gate.transaction(() => base(...args)) : base(...args))
+      }
+      if (prop === 'project' || prop === 'projectEnvVar') {
+        const delegate = Reflect.get(target, prop, target) as object
+        return new Proxy(delegate, {
+          get(d, m) {
+            const value = Reflect.get(d, m, d)
+            if (typeof value !== 'function') return value
+            const fn = (value as (...args: unknown[]) => unknown).bind(d)
+            // Only the gated methods become plain async functions; every
+            // other method must keep returning a PrismaPromise (array-form
+            // $transaction requires them).
+            const gated = (prop === 'project' && ((m === 'findUnique' && gate.findUnique) || (m === 'delete' && gate.beforeProjectDelete)))
+              || (prop === 'projectEnvVar' && m === 'findMany' && gate.findMany)
+            if (!gated) return fn
+            return async (...args: unknown[]) => {
+              if (prop === 'project' && m === 'delete' && gate.beforeProjectDelete) await gate.beforeProjectDelete()
+              const result = await fn(...args)
+              if (prop === 'project' && m === 'findUnique' && gate.findUnique) await gate.findUnique(args[0])
+              if (prop === 'projectEnvVar' && m === 'findMany' && gate.findMany) await gate.findMany(args[0])
+              return result
+            }
+          },
+        })
+      }
+      return Reflect.get(target, prop, target)
+    },
+  }) as PrismaClient
+}
 function runtime(): PreviewRuntime {
   return { provision: vi.fn(async (_project, _tarball, _ports, persist) => {
     await persist({ ANON_KEY: 'synthetic-anon', SERVICE_ROLE_KEY: 'never-return-this', POSTGRES_PASSWORD: 'never-return-this', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
@@ -46,7 +95,14 @@ it('returns one operation at a uniqueness latch, queues one provision, persists 
   await service.idle()
   expect(stack.provision).toHaveBeenCalledTimes(1)
   expect(await db.project.count({ where: { repository: 'acme/app', branch: 'latch' } })).toBe(1)
-  expect((await service.ensure(identity('latch'), Buffer.from('replacement'))).id).toBe(a.id)
+  // A changed bundle updates the existing preview under the same project
+  // row (T20): a new operation for the new bundle, still one environment.
+  const updated = await service.ensure(identity('latch'), bundle('alter table replacement;'))
+  expect(updated.id).not.toBe(a.id)
+  expect(updated.projectId).toBe(a.projectId)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'latch' } })).toBe(1)
   expect(await service.status('acme/app', a.id)).toEqual({ operationId: a.id, state: 'ready', error: null, url: 'https://preview.example.invalid', anonKey: 'synthetic-anon',
     hostname: `${(await db.project.findUniqueOrThrow({ where: { id: a.projectId } })).slug}.preview.example.invalid` })
   expect(await service.status('other/app', a.id)).toBeNull()
@@ -87,9 +143,131 @@ it('retains failed stacks without exposing diagnostics, then removes them', asyn
   expect(JSON.stringify(status)).not.toContain('secret')
   expect(status).not.toHaveProperty('url')
   expect(stack.destroy).not.toHaveBeenCalled()
-  expect((await service.ensure(identity('broken'), Buffer.from('retry'))).id).toBe(operation.id)
+  // Same-hash retry: stays failed, no retry loop, no new provision (T20).
+  expect((await service.ensure(identity('broken'), Buffer.from('bundle'))).id).toBe(operation.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  // Changed-hash retry (the fix push) re-provisions under the same row.
+  const retry = await service.ensure(identity('broken'), bundle('alter table retry;'))
+  expect(retry.id).not.toBe(operation.id)
+  expect(retry.projectId).toBe(operation.projectId)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(await service.status('acme/app', retry.id)).toMatchObject({ state: 'failed' })
+  // Destroy removes the stack the update rebuilt before failing.
   await service.destroy('acme/app', operation.id)
-  expect(stack.destroy).toHaveBeenCalledTimes(1)
+  expect(stack.destroy).toHaveBeenCalledTimes(2)
+})
+
+it('applies a changed bundle to the existing preview and keeps the hostname', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const firstBundle = bundle('alter table one;')
+  const secondBundle = bundle('alter table two;')
+  const first = await service.ensure(identity('update'), firstBundle)
+  await service.idle()
+  const before = await service.status('acme/app', first.id)
+  const second = await service.ensure(identity('update'), secondBundle)
+  await service.idle()
+  expect(second.id).not.toBe(first.id)
+  expect(second.projectId).toBe(first.projectId)
+  // The rebuilt environment comes from the second bundle (T20).
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(vi.mocked(stack.provision).mock.calls[1][1]).toEqual(secondBundle)
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'update' } })).toBe(1)
+  const after = await service.status('acme/app', second.id)
+  expect(after).toMatchObject({ state: 'ready' })
+  expect(after?.hostname).toBe(before?.hostname)
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', second.id)
+})
+
+it('leaves the preview untouched when the same bundle is ensured again', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('unchanged'), Buffer.from('unchanged-bundle'))
+  await service.idle()
+  const again = await service.ensure(identity('unchanged'), Buffer.from('unchanged-bundle'))
+  expect(again.id).toBe(first.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  expect(stack.destroy).not.toHaveBeenCalled()
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'unchanged' } })).toBe(1)
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', first.id)
+})
+
+it('keeps one environment and updates the pull request number on re-ensure', async () => {
+  const stack = runtime()
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
+  const first = await service.ensure(identity('pr-meta'), Buffer.from('pr-meta-bundle'))
+  await service.idle()
+  const second = await service.ensure(normalizePreviewIdentity({ repository: 'Acme/App', branch: 'pr-meta', pullRequestNumber: 43 }), Buffer.from('pr-meta-bundle'))
+  expect(second.id).toBe(first.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'pr-meta' } })).toBe(1)
+  expect(await db.project.findUniqueOrThrow({ where: { id: first.projectId } })).toMatchObject({ pullRequestNumber: 43 })
+  await service.destroy('acme/app', first.id)
+})
+
+it('serializes two ensures with different bundles instead of provisioning concurrently', async () => {
+  const stack = runtime()
+  let inFlight = 0
+  let maxInFlight = 0
+  stack.provision = vi.fn(async (_project, _tarball, _ports, persist) => {
+    await persist({ ANON_KEY: 'serial-anon', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+    inFlight++
+    maxInFlight = Math.max(maxInFlight, inFlight)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    inFlight--
+  })
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
+  const firstBundle = bundle('alter table serial a;')
+  const secondBundle = bundle('alter table serial b;')
+  const first = await service.ensure(identity('serial'), firstBundle)
+  const second = await service.ensure(identity('serial'), secondBundle)
+  await service.idle()
+  expect(second.id).not.toBe(first.id)
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  expect(maxInFlight).toBe(1)
+  // The last bundle wins: the second update is what the environment ends on.
+  expect(vi.mocked(stack.provision).mock.calls[1][1]).toEqual(secondBundle)
+  expect(await db.project.count({ where: { repository: 'acme/app', branch: 'serial' } })).toBe(1)
+  await service.destroy('acme/app', second.id)
+})
+
+it('ends destroyed with no leftovers when destroy arrives during an update', async () => {
+  const stack = runtime()
+  let release!: () => void
+  const latch = new Promise<void>(resolve => { release = resolve })
+  let updating = false
+  stack.provision = vi.fn(async (_project, _tarball, _ports, persist) => {
+    await persist({ ANON_KEY: 'race-anon', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+    if (updating) await latch
+  })
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('race'), bundle('alter table race a;'))
+  await service.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  updating = true
+  const second = await service.ensure(identity('race'), bundle('alter table race b;'))
+  expect(second.id).not.toBe(first.id)
+  const deletion = service.destroy('acme/app', first.id)
+  // Destroy joins the in-flight update instead of tearing down under it.
+  expect(stack.destroy).not.toHaveBeenCalled()
+  release()
+  expect(await deletion).toBe(true)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  // The update's own teardown, then destroy's teardown of the rebuilt stack.
+  expect(stack.destroy).toHaveBeenCalledTimes(2)
+  expect(vi.mocked(stack.destroy).mock.calls[1][0].id).toBe(first.projectId)
+  expect(tunnel.routes()).toHaveLength(0)
+  expect(await db.project.count({ where: { id: first.projectId } })).toBe(0)
 })
 
 it('recovers queued and provisioning operations on startup and permits destroy', async () => {
@@ -190,4 +368,536 @@ it('authenticates every route, validates input, normalizes identity and prevents
     body: JSON.stringify({ operationId }) }))
   expect(removed.status).toBe(200)
   expect(authenticate).toHaveBeenCalledTimes(7)
+})
+
+it('destroy waits for every registering update and leaves nothing behind (T20 review 1)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const bundleA = bundle('alter table a;')
+  const bundleB = bundle('alter table b;')
+  // Seam: hold BOTH updates at their ports lookup (accepted, job not yet
+  // registered). The old shared-Set code lets A's cleanup drop B's
+  // ownership while B is still registering; the fixed code gives each
+  // registration its own token and serializes claims.
+  const portsA = latch(); const gateA = latch()
+  const portsB = latch(); const gateB = latch()
+  // Seam: hold destroy at its row deletion - after its job-map snapshot
+  // and its teardown - until the test releases it.
+  const deleteEntered = latch(); const deleteGate = latch()
+  let reads = 0; let deleteSeen = false
+  deleteEntered.promise.then(() => { deleteSeen = true })
+  const service = createPreviewService(gatedDb({
+    findMany: async () => {
+      const read = ++reads
+      if (read === 1) { portsA.release(); await gateA.promise }
+      if (read === 2) { portsB.release(); await gateB.promise }
+    },
+    beforeProjectDelete: async () => { deleteEntered.release(); await deleteGate.promise },
+  }), stack, { tunnel })
+  const first = await service.ensure(identity('set-race'), bundle('select 0;'))
+  await service.idle()
+  const marker = path.join(directory, 'set-race-marker')
+  const enteredB = latch(); const finishB = latch()
+  stack.provision = vi.fn(async (_project, tarball, _ports, persist) => {
+    await persist({ ANON_KEY: 'synthetic', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+    if (tarball.equals(bundleB)) { enteredB.release(); await finishB.promise }
+    await fs.writeFile(marker, 'provisioned')
+  })
+  stack.destroy = vi.fn(async () => { await fs.rm(marker, { force: true }) })
+  const updateA = service.ensure(identity('set-race'), bundleA)
+  const updateB = service.ensure(identity('set-race'), bundleB)
+  await portsA.promise
+  // Which schedule is live? The old shared-Set code registers both updates
+  // concurrently (B reaches its ports lookup while A is held); the fixed
+  // code serializes claims, so B cannot start registering until A's
+  // registration finishes. Bounded real DB awaits decide; no timing sleep.
+  let concurrent = false
+  portsB.promise.then(() => { concurrent = true })
+  for (let i = 0; i < 100 && !concurrent; i++) await db.operation.count()
+  gateA.release()
+  await updateA
+  if (concurrent) {
+    // Old schedule, forced: A's cleanup dropped B's shared Set entry while
+    // B is still registering, so destroy snapshots no job for B at all.
+    const deletion = service.destroy('acme/app', first.id)
+    for (let i = 0; i < 100 && !deleteSeen; i++) await db.operation.count()
+    gateB.release()
+    await updateB
+    await enteredB.promise
+    finishB.release()
+    await service.idle()
+    await deleteEntered.promise
+    // Destroy tore down before B provisioned, so B's marker outlives the
+    // deleted row - the leftover the token fix prevents.
+    expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+    deleteGate.release()
+    expect(await deletion).toBe(true)
+  } else {
+    // Fixed schedule: registrations serialize and destroy waits out B's.
+    await portsB.promise
+    const deletion = service.destroy('acme/app', first.id)
+    gateB.release()
+    await updateB
+    await enteredB.promise
+    finishB.release()
+    await service.idle()
+    await deleteEntered.promise
+    expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+    deleteGate.release()
+    expect(await deletion).toBe(true)
+  }
+  expect(await db.project.findUnique({ where: { id: first.projectId } })).toBeNull()
+})
+
+it('settling an older failed attempt keeps the newer job tracked for destroy (T20 review 2)', async () => {
+  const bundleA = bundle('alter table a;')
+  const bundleB = bundle('alter table b;')
+  const failA = latch(); const enteredA = latch(); const enteredB = latch(); const finishB = latch()
+  const deleteEntered = latch(); const deleteGate = latch()
+  let deleteSeen = false; let injectFailure = false
+  deleteEntered.promise.then(() => { deleteSeen = true })
+  const marker = path.join(directory, 'unfinished-survivor')
+  const stack: PreviewRuntime = {
+    provision: vi.fn(async (_p, tarball, _ports, persist) => {
+      if (tarball.equals(bundleA)) { enteredA.release(); await failA.promise; injectFailure = true; throw new Error('import failed') }
+      await persist({ ANON_KEY: 'synthetic', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+      enteredB.release(); await finishB.promise
+      await fs.writeFile(marker, 'b')
+    }),
+    destroy: vi.fn(async () => { await fs.rm(marker, { force: true }) }),
+  }
+  const service = createPreviewService(gatedDb({
+    transaction: async run => {
+      if (injectFailure) { injectFailure = false; throw new Error('failure settlement unavailable') }
+      return run()
+    },
+    beforeProjectDelete: async () => { deleteEntered.release(); await deleteGate.promise },
+  }), stack, { tunnel: fakeTunnel() })
+  const a = await service.ensure(identity('unfinished-race'), bundleA)
+  await enteredA.promise
+  await service.ensure(identity('unfinished-race'), bundleB)
+  failA.release()
+  await enteredB.promise
+  expect((await db.operation.findUniqueOrThrow({ where: { id: a.id } })).state).toBe('provisioning')
+  // Settling A must not drop B's tracked job.
+  expect(await service.status('acme/app', a.id)).toMatchObject({ state: 'failed' })
+  const deletion = service.destroy('acme/app', a.id)
+  // Destroy either waits B's job (fixed) or - once its job-map snapshot
+  // missed it - proceeds to the row-delete seam (old). B is only released
+  // after destroy is at that seam or waiting on B itself.
+  for (let i = 0; i < 100 && !deleteSeen; i++) await db.operation.count()
+  finishB.release()
+  await service.idle()
+  await deleteEntered.promise
+  // Destroy joined the surviving update: B's marker is gone. (53c1fac:
+  // settleUnfinished dropped B's job unconditionally, destroy never waited,
+  // and the marker outlives the deleted row.)
+  expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+  deleteGate.release()
+  expect(await deletion).toBe(true)
+  expect(await db.project.findUnique({ where: { id: a.projectId } })).toBeNull()
+})
+
+it('an old ready operation exposes no credentials while its replacement is unready or failed (T20 review 3)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('stale-creds'), bundle('select 1;'))
+  await service.idle()
+  expect(await service.status('acme/app', first.id)).toMatchObject({ state: 'ready', anonKey: 'synthetic-anon' })
+  const entered = latch(); const finish = latch()
+  const failReplacement = { value: false }
+  stack.provision = vi.fn(async (_p, _t, _ports, persist) => {
+    await persist({ ANON_KEY: 'replacement-not-ready', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+    entered.release(); await finish.promise
+    if (failReplacement.value) throw new Error('health failed')
+  })
+  const second = await service.ensure(identity('stale-creds'), bundle('select 2;'))
+  await entered.promise
+  expect(tunnel.routes()).toHaveLength(0)
+  const mid = await service.status('acme/app', first.id)
+  expect(mid).toMatchObject({ state: 'ready' })
+  expect(mid).not.toHaveProperty('anonKey')
+  expect(mid).not.toHaveProperty('url')
+  expect(mid).not.toHaveProperty('hostname')
+  expect(await service.status('acme/app', second.id)).toMatchObject({ state: 'provisioning' })
+  // A failing replacement keeps the old operation credential-less too.
+  failReplacement.value = true
+  finish.release()
+  await service.idle()
+  const after = await service.status('acme/app', first.id)
+  expect(after).toMatchObject({ state: 'ready' })
+  expect(after).not.toHaveProperty('anonKey')
+  expect(await service.status('acme/app', second.id)).toMatchObject({ state: 'failed' })
+  await service.destroy('acme/app', first.id)
+})
+
+it('a late same-hash re-ensure cannot re-route a rebuilding preview (T20 review 4)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const bundleA = bundle('select 1;')
+  const bundleB = bundle('select 2;')
+  const captured = latch(); const resume = latch()
+  const arm = { value: false }; let intercepted = false
+  const service = createPreviewService(gatedDb({ findUnique: async (args) => {
+    const where = (args as { where?: { repository_branch?: unknown } })?.where
+    if (arm.value && where?.repository_branch && !intercepted) { intercepted = true; captured.release(); await resume.promise }
+  } }), stack, { tunnel })
+  const first = await service.ensure(identity('late-reassert'), bundleA)
+  await service.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  arm.value = true
+  const stale = service.ensure(identity('late-reassert'), bundleA)
+  await captured.promise
+  const entered = latch(); const finish = latch()
+  stack.provision = vi.fn(async () => { entered.release(); await finish.promise })
+  const update = await service.ensure(identity('late-reassert'), bundleB)
+  await entered.promise
+  expect(tunnel.routes()).toHaveLength(0)
+  resume.release()
+  await stale
+  expect((await db.operation.findUniqueOrThrow({ where: { id: update.id } })).state).toBe('provisioning')
+  // The stale request must not have reopened the route mid-rebuild.
+  // (53c1fac: it re-asserted the route while the update was provisioning.)
+  expect(tunnel.routes()).toHaveLength(0)
+  finish.release()
+  await service.idle()
+  await service.destroy('acme/app', first.id)
+})
+
+it('a late re-ensure of the claiming bundle neither re-routes nor reclaims (T20 review 4)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const bundleB = bundle('select 2;')
+  const captured = latch(); const resume = latch()
+  const arm = { value: false }; let intercepted = false
+  const service = createPreviewService(gatedDb({ findUnique: async (args) => {
+    const where = (args as { where?: { repository_branch?: unknown } })?.where
+    if (arm.value && where?.repository_branch && !intercepted) { intercepted = true; captured.release(); await resume.promise }
+  } }), stack, { tunnel })
+  const first = await service.ensure(identity('late-reclaim'), bundle('select 1;'))
+  await service.idle()
+  arm.value = true
+  const stale = service.ensure(identity('late-reclaim'), bundleB)
+  await captured.promise
+  const entered = latch(); const finish = latch()
+  stack.provision = vi.fn(async () => { entered.release(); await finish.promise })
+  const update = await service.ensure(identity('late-reclaim'), bundleB)
+  await entered.promise
+  resume.release()
+  // The stale request is identical to the claiming bundle: it must resolve
+  // to that claim without re-routing or claiming a second rebuild. Only the
+  // update's provision runs on the replaced stub.
+  expect((await stale).id).toBe(update.id)
+  expect(stack.provision).toHaveBeenCalledTimes(1)
+  expect(tunnel.routes()).toHaveLength(0)
+  finish.release()
+  await service.idle()
+  await service.destroy('acme/app', first.id)
+})
+
+it('two simultaneous re-ensures of the same bundle claim exactly one rebuild (T20 review 5)', async () => {
+  const stack = runtime()
+  const bundleB = bundle('alter table b;')
+  const both = latch(); let reads = 0
+  const arm = { value: false }
+  const service = createPreviewService(gatedDb({ findUnique: async (args) => {
+    const where = (args as { where?: { repository_branch?: unknown } })?.where
+    if (arm.value && where?.repository_branch && ++reads <= 2) { if (reads === 2) both.release(); await both.promise }
+  } }), stack, { tunnel: fakeTunnel() })
+  await service.ensure(identity('duplicate-update'), bundle('alter table a;'))
+  await service.idle()
+  arm.value = true
+  const [a, b] = await Promise.all([
+    service.ensure(identity('duplicate-update'), bundleB),
+    service.ensure(identity('duplicate-update'), bundleB),
+  ])
+  await service.idle()
+  // One claim, one rebuild on top of the initial provision.
+  // (53c1fac: two operations and two rebuilds.)
+  expect(a.id).toBe(b.id)
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  await service.destroy('acme/app', a.id)
+})
+
+it('an older unsettled attempt cannot override the current ready environment (T20 review 6)', async () => {
+  const bundleA = bundle('alter table a;')
+  const bundleB = bundle('alter table b;')
+  const entered = latch(); const fail = latch(); let inject = false
+  const wrapped = new Proxy(db, { get(target, prop) {
+    if (prop === '$transaction') return (...args: unknown[]) => {
+      if (inject) { inject = false; return Promise.reject(new Error('settlement unavailable')) }
+      return (target.$transaction as (...values: unknown[]) => Promise<unknown>)(...args)
+    }
+    return Reflect.get(target, prop, target)
+  } }) as PrismaClient
+  const stack = runtime()
+  stack.provision = vi.fn(async (_p, tarball, _ports, persist) => {
+    if (tarball.equals(bundleA)) { entered.release(); await fail.promise; inject = true; throw new Error('import failed') }
+    await persist({ ANON_KEY: 'new-ready', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+  })
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(wrapped, stack, { tunnel })
+  const a = await service.ensure(identity('wrong-owner'), bundleA)
+  await entered.promise
+  const b = await service.ensure(identity('wrong-owner'), bundleB)
+  expect(b.id).not.toBe(a.id)
+  fail.release()
+  await service.idle()
+  expect((await db.operation.findUniqueOrThrow({ where: { id: b.id } })).state).toBe('ready')
+  // The ready attempt owns the status write (53c1fac: left 'provisioning').
+  expect((await db.project.findUniqueOrThrow({ where: { id: b.projectId } })).status).toBe('active')
+  const again = await service.ensure(identity('wrong-owner'), bundleB)
+  // Same-hash lookup returns the owning attempt and the late settlement of
+  // the older one cannot flip the project to failed.
+  // (53c1fac: returns a.id and flips the status to 'failed'.)
+  expect(again.id).toBe(b.id)
+  expect((await db.project.findUniqueOrThrow({ where: { id: b.projectId } })).status).toBe('active')
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', b.id)
+})
+
+it('startup recovery does not fail a project whose owner moved on (T20 review 6)', async () => {
+  const owner = await db.user.findUniqueOrThrow({ where: { email: PREVIEW_OWNER_EMAIL } })
+  const project = await db.project.create({ data: { ...identity('recover-owner'), name: 'owner', slug: 'recover-owner',
+    ownerId: owner.id, environmentType: 'preview', status: 'active', currentOperationId: 'op-current',
+    operations: { create: [
+      { id: 'op-old', kind: PREVIEW_OPERATION_KIND, state: 'provisioning' },
+      { id: 'op-current', kind: PREVIEW_OPERATION_KIND, state: 'ready' },
+    ] } } })
+  const service = createPreviewService(db, runtime(), { tunnel: fakeTunnel() })
+  expect(await service.start()).toBe(1)
+  expect(await db.operation.findUniqueOrThrow({ where: { id: 'op-old' } })).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
+  // Recovery may only fail a project the interrupted attempt owned.
+  // (53c1fac: marks every project with a failed operation 'failed'.)
+  expect((await db.project.findUniqueOrThrow({ where: { id: project.id } })).status).toBe('active')
+  await service.destroy('acme/app', 'op-current')
+})
+
+it('an invalid replacement never tears down a healthy preview (T20 review 9)', async () => {
+  const marker = path.join(directory, 'invalid-replacement-stack')
+  const tunnel = fakeTunnel()
+  const stack: PreviewRuntime = {
+    provision: vi.fn(async (_p, _t, _ports, persist) => {
+      await persist({ ANON_KEY: 'healthy-anon', SUPABASE_PUBLIC_URL: 'https://preview.example.invalid' })
+      await fs.writeFile(marker, 'stack')
+    }),
+    destroy: vi.fn(async () => { await fs.rm(marker, { force: true }) }),
+  }
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('invalid-replacement'), bundle('select 1;'))
+  await service.idle()
+  expect(await fs.access(marker).then(() => true, () => false)).toBe(true)
+  // Garbage and migration-free bundles have no validated contents...
+  const broken = await service.ensure(identity('invalid-replacement'), Buffer.from('invalid-one'))
+  const empty = await service.ensure(identity('invalid-replacement'), buildTarball([{ name: 'supabase/seed.sql', body: 'insert into a;' }]))
+  await service.idle()
+  // ...so they record failed operations and leave the live stack, route and
+  // recorded hash untouched (53c1fac: each one tore the healthy stack down).
+  expect(broken.id).not.toBe(first.id)
+  expect(empty.id).not.toBe(first.id)
+  expect(await service.status('acme/app', broken.id)).toMatchObject({ state: 'failed' })
+  expect(await service.status('acme/app', empty.id)).toMatchObject({ state: 'failed' })
+  expect(stack.destroy).not.toHaveBeenCalled()
+  expect(await fs.access(marker).then(() => true, () => false)).toBe(true)
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(await service.status('acme/app', first.id)).toMatchObject({ state: 'ready', anonKey: 'healthy-anon' })
+  await service.destroy('acme/app', first.id)
+  expect(stack.destroy).toHaveBeenCalledTimes(1)
+  expect(await fs.access(marker).then(() => true, () => false)).toBe(false)
+})
+
+it('a pre-upgrade preview with no recorded hash rebuilds exactly once (T20 P3)', async () => {
+  const stack = runtime()
+  const service = createPreviewService(db, stack, { tunnel: fakeTunnel() })
+  const healthy = bundle('select 1;')
+  const first = await service.ensure(identity('null-hash'), healthy)
+  await service.idle()
+  // Simulate a row provisioned before the T20 migration: the old bundle's
+  // content is unknown, so the incoming hash is never silently adopted.
+  await db.project.update({ where: { id: first.projectId }, data: { bundleHash: null } })
+  const rebuilt = await service.ensure(identity('null-hash'), healthy)
+  expect(rebuilt.id).not.toBe(first.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  const again = await service.ensure(identity('null-hash'), healthy)
+  expect(again.id).toBe(rebuilt.id)
+  await service.idle()
+  expect(stack.provision).toHaveBeenCalledTimes(2)
+  await service.destroy('acme/app', rebuilt.id)
+})
+
+it('settles a failure appended while settlement is running (T20 review R2-1)', async () => {
+  const aBundle = bundle('alter table a;')
+  const bBundle = bundle('alter table b;')
+  const enteredA = latch(); const failA = latch(); const enteredB = latch(); const failB = latch()
+  const settleEntered = latch(); const settleGate = latch()
+  let rejectNext = false; let gateNext = false
+  const service = createPreviewService(gatedDb({ transaction: async run => {
+    if (rejectNext) { rejectNext = false; throw new Error('settlement write unavailable') }
+    if (gateNext) { gateNext = false; settleEntered.release(); await settleGate.promise }
+    return run()
+  } }), {
+    provision: vi.fn(async (_p, tarball) => {
+      if (tarball.equals(aBundle)) { enteredA.release(); await failA.promise }
+      else { enteredB.release(); await failB.promise }
+      rejectNext = true
+      throw new Error('import failed')
+    }),
+    destroy: vi.fn(async () => {}),
+  }, { tunnel: fakeTunnel() })
+  const a = await service.ensure(identity('unfinished-mutation'), aBundle)
+  await enteredA.promise
+  const b = await service.ensure(identity('unfinished-mutation'), bBundle)
+  failA.release()
+  await enteredB.promise
+  gateNext = true
+  const settle = service.status('acme/app', a.id)
+  await settleEntered.promise
+  // B's failure lands while A's settlement write is in flight.
+  failB.release()
+  await service.idle()
+  settleGate.release()
+  await settle
+  // The settlement must drain B's failure too (82c1f86: B is discarded
+  // mid-settlement and stays 'provisioning' with destroy rejected).
+  expect((await db.operation.findUniqueOrThrow({ where: { id: b.id } })).state).toBe('failed')
+  expect(await service.status('acme/app', b.id)).toMatchObject({ state: 'failed' })
+  expect(await service.destroy('acme/app', a.id)).toBe(true)
+})
+
+it('rejected replacements cannot evict the owner from lookup (T20 review R2-2)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const valid = bundle('select 1;')
+  const first = await service.ensure(identity('owner-window'), valid)
+  await service.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  // Three distinct rejected replacements: each records a failed attempt.
+  for (let n = 0; n < 3; n++) {
+    const rejected = await service.ensure(identity('owner-window'), Buffer.from(`invalid-${n}`))
+    expect(await service.status('acme/app', rejected.id)).toMatchObject({ state: 'failed' })
+  }
+  const host = tunnel.routes()[0].hostname!
+  await tunnel.removePreviewRoute(host)
+  // The unchanged valid bundle must resolve to the recorded owner and
+  // restore its route (82c1f86: returns a rejected failed id and leaves
+  // the route lost).
+  const again = await service.ensure(identity('owner-window'), valid)
+  expect(again.id).toBe(first.id)
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(tunnel.routes()[0].hostname).toBe(host)
+  await service.destroy('acme/app', first.id)
+})
+
+it('startup recovery keeps the current owner route (T20 review R2-3)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const firstService = createPreviewService(db, stack, { tunnel })
+  const current = await firstService.ensure(identity('recovery-route'), bundle('select 1;'))
+  await firstService.idle()
+  expect(tunnel.routes()).toHaveLength(1)
+  const host = tunnel.routes()[0].hostname!
+  // An older attempt of the same project is stuck from a previous life.
+  await db.operation.create({ data: { id: 'old-unsettled', projectId: current.projectId,
+    kind: PREVIEW_OPERATION_KIND, state: 'provisioning', createdAt: new Date(0) } })
+  const restarted = createPreviewService(db, stack, { tunnel })
+  expect(await restarted.start()).toBe(1)
+  // The interrupted attempt settles without touching the route its
+  // project's owner is serving on (82c1f86: removes the route while
+  // keeping the project active and the owner ready).
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(tunnel.routes()[0].hostname).toBe(host)
+  expect(await db.operation.findUniqueOrThrow({ where: { id: 'old-unsettled' } })).toMatchObject({ state: 'failed', error: 'interrupted by restart' })
+  expect((await db.project.findUniqueOrThrow({ where: { id: current.projectId } })).status).toBe('active')
+  expect(await restarted.status('acme/app', current.id)).toMatchObject({ state: 'ready', hostname: host })
+  await restarted.destroy('acme/app', current.id)
+})
+
+it('dedupes repeated identical invalid replacements (T20 review R2-6)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  const service = createPreviewService(db, stack, { tunnel })
+  const first = await service.ensure(identity('dedupe'), bundle('select 1;'))
+  await service.idle()
+  const bad = Buffer.from('bad-bytes')
+  const rejected = await service.ensure(identity('dedupe'), bad)
+  const again = await service.ensure(identity('dedupe'), bad)
+  // Identical retries resolve to the same failed operation: no new
+  // history, no ownership change, no status change.
+  // (82c1f86: a fresh failed row per retry.)
+  expect(again.id).toBe(rejected.id)
+  expect(await service.status('acme/app', again.id)).toMatchObject({ state: 'failed' })
+  expect(await db.operation.count({ where: { projectId: first.projectId, kind: PREVIEW_OPERATION_KIND } })).toBe(2)
+  const project = await db.project.findUniqueOrThrow({ where: { id: first.projectId } })
+  expect(project.currentOperationId).toBe(first.id)
+  expect(project.status).toBe('active')
+  expect(tunnel.routes()).toHaveLength(1)
+  await service.destroy('acme/app', first.id)
+})
+
+it('a pending cleanup retry cannot remove a newer owner route (T20 review R3-1)', async () => {
+  const stack = runtime()
+  const tunnel = fakeTunnel()
+  // Owner A is an interrupted attempt whose route cleanup is pending.
+  const owner = await db.user.upsert({ where: { email: PREVIEW_OWNER_EMAIL }, update: {},
+    create: { email: PREVIEW_OWNER_EMAIL, name: 'Preview service', password: '!disabled-preview-service' } })
+  const project = await db.project.create({ data: { ...identity('stale-cleanup'), name: 'stale', slug: 'stale-cleanup',
+    ownerId: owner.id, environmentType: 'preview', status: 'provisioning', currentOperationId: 'op-a',
+    operations: { create: { id: 'op-a', kind: PREVIEW_OPERATION_KIND, state: 'provisioning' } } } })
+  await db.projectEnvVar.create({ data: { projectId: project.id, key: 'API_GW_HTTP_PORT', value: '23456' } })
+  const host = previewHostname(project.slug, tunnel.domain)
+  await tunnel.addPreviewRoute(host, 'http://127.0.0.1:9')
+  // First recovery removal fails: A stays non-terminal and retryable.
+  vi.spyOn(tunnel, 'removePreviewRoute').mockImplementationOnce(async () => { throw new Error('tunnel unavailable') })
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  // Seam: pause a cleanup retry after its ownership read, before removal.
+  const arm = { value: false }; const captured = latch(); const resume = latch()
+  let paused = false
+  const service = createPreviewService(gatedDb({ findUnique: async (args) => {
+    const request = args as { where?: { id?: unknown }; select?: unknown }
+    if (arm.value && !paused && request?.where?.id === project.id && request.select) {
+      paused = true; captured.release(); await resume.promise
+    }
+  } }), stack, { tunnel })
+  expect(await service.start()).toBe(0)
+  expect((await db.operation.findUniqueOrThrow({ where: { id: 'op-a' } })).state).toBe('provisioning')
+  expect(tunnel.routes()).toHaveLength(1)
+  arm.value = true
+  const retry = service.start() // retry #1: ownership read captured, paused
+  await captured.promise
+  // Retry #2 and an ensure try to finish B while retry #1 is paused.
+  const claim = service.ensure(identity('stale-cleanup'), bundle('alter table b;'))
+  let claimed = false
+  claim.then(() => { claimed = true }, () => { claimed = true })
+  for (let i = 0; i < 100 && !claimed; i++) await db.operation.count()
+  let bOp: { id: string }
+  if (claimed) {
+    // Old schedule: the claim ran while retry #1 held a stale owner read.
+    bOp = await claim
+    await service.idle()
+    expect(tunnel.routes()).toHaveLength(1) // B is routed (sanity)
+    resume.release()
+    await retry
+    // The stale retry must not remove B's fresh route.
+    expect(tunnel.routes()).toHaveLength(1) // fails on b485108: route gone
+  } else {
+    // Fixed schedule: retry #1 holds the claim lock, so the claim waits.
+    resume.release()
+    await retry
+    bOp = await claim
+    await service.idle()
+    expect(tunnel.routes()).toHaveLength(1)
+  }
+  // Both schedules end with B owning the project, reachable and ready on
+  // the unchanged hostname.
+  const status = await service.status('acme/app', bOp.id)
+  expect(status).toMatchObject({ state: 'ready', hostname: host })
+  expect(tunnel.routes()).toHaveLength(1)
+  expect(tunnel.routes()[0].hostname).toBe(host)
+  expect((await db.operation.findUniqueOrThrow({ where: { id: 'op-a' } })).state).toBe('failed')
+  expect((await db.project.findUniqueOrThrow({ where: { id: project.id } })).currentOperationId).toBe(bOp.id)
+  await service.destroy('acme/app', bOp.id)
+  vi.restoreAllMocks()
 })

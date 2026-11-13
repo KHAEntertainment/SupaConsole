@@ -52,7 +52,7 @@
 
 import { promises as fs } from 'fs'
 import * as path from 'path'
-import { randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { Parser, type ReadEntry } from 'tar'
 
 // What we recognize inside the bundle. Anything else is skipped, not rejected:
@@ -518,6 +518,46 @@ async function validateBundle(opts: {
   }
   await Promise.all(drained)
 
+  // Symlink-parent aliasing (T20 review finding 7): a write under an
+  // archive-created symlink lands on the symlink's target, so two archives
+  // that differ only in write order can extract different code. Reject the
+  // whole bundle instead: no entry may live under a path the archive itself
+  // turns into a symlink. Checked after the full parse so entry order
+  // cannot dodge it, and in validation so ingest and hashing agree.
+  const symlinkPaths = new Set<string>()
+  for (const entry of out) {
+    if (entry.linkTarget !== undefined) symlinkPaths.add(entry.destPath)
+  }
+  if (symlinkPaths.size > 0) {
+    for (const entry of out) {
+      let parent = path.dirname(entry.destPath)
+      while (parent !== supabaseRoot && parent !== path.dirname(parent)) {
+        if (symlinkPaths.has(parent)) {
+          throw new InvalidBundleError(
+            `Bundle entry is written through an archive symlink parent: ${JSON.stringify(entry.rawPath)}`,
+            entry.rawPath
+          )
+        }
+        parent = path.dirname(parent)
+      }
+    }
+  }
+  // Directory markers colliding with file or symlink entries fail
+  // extraction order-dependently (mkdir over a file, or write over a
+  // directory), so reject them here for the same reason.
+  const writtenPaths = new Set<string>()
+  for (const entry of out) {
+    if (entry.mode !== undefined) writtenPaths.add(entry.destPath)
+  }
+  for (const entry of out) {
+    if (entry.mode === undefined && writtenPaths.has(entry.destPath)) {
+      throw new InvalidBundleError(
+        `Bundle entry collides with a file or symlink at the same path: ${JSON.stringify(entry.rawPath)}`,
+        entry.rawPath
+      )
+    }
+  }
+
   if (migrationsSeen === 0) {
     throw new NoMigrationsError()
   }
@@ -980,6 +1020,115 @@ export async function ingestBundle(options: IngestBundleOptions): Promise<Ingest
     seedPath: seedEntry ? seedEntry.destPath : null,
     extracted,
   }
+}
+
+// Synthetic root used for the hashing pass. `validateBundle` only does
+// path math (no disk I/O), so any fixed root works; the hash is computed
+// over paths relative to it, which makes the digest independent of where
+// a real ingest would have extracted to.
+const HASH_ROOT = path.resolve('/bundle-content-hash')
+const HASH_IN_TREE_FUNCTIONS_PATH = path.join(HASH_ROOT, 'supabase', 'functions')
+
+// Digest of the bundle's *extracted, validated* contents: the sorted
+// (path, per-file content hash) of every file and symlink the ingest
+// pass would land under the supabase root. Deliberately NOT the raw
+// tarball bytes: tar mtimes (and other header fields) would make
+// byte-identical content hash differently when repacked, and preview
+// re-ensure must treat "same content, new commit metadata" as unchanged.
+// Directories carry no content and modes are stripped deterministically,
+// so neither participates in the digest.
+//
+// The full validation pass runs first, so hashing can never accept an
+// entry the ingest would reject (size caps, traversal, symlink escape,
+// hardlinks, entry-count limits). Bodies are then re-read from the same
+// buffer pairing parser emissions by archive order, exactly like
+// `extractValidated`, and hashed one at a time.
+//
+// A bundle that fails validation (or has no migrations) has no validated
+// contents to hash. Ingest would reject it anyway, so change detection
+// falls back to a domain-separated hash of the raw bytes: an identical
+// retry stays a no-op, and any different bytes re-attempt (and fail)
+// once. The two domains can never collide.
+export interface BundleContentHash {
+  // sha256 over the extracted, validated contents (or, when the bundle has
+  // no validated contents, a domain-separated hash of the raw bytes).
+  hash: string
+  // False when the bundle failed validation or contains no migrations:
+  // there were no validated contents to hash and ingest would reject it.
+  valid: boolean
+}
+export async function bundleContentHash(input: Buffer | Uint8Array): Promise<BundleContentHash> {
+  const tarball = asBuffer(input)
+  try {
+    const entries = await validateBundle({
+      tarball,
+      projectDir: HASH_ROOT,
+      functionsMountPath: HASH_IN_TREE_FUNCTIONS_PATH,
+      inTreeFunctionsPath: HASH_IN_TREE_FUNCTIONS_PATH,
+    })
+    return { hash: await hashValidatedContents(entries, tarball), valid: true }
+  } catch (error) {
+    if (error instanceof InvalidBundleError || error instanceof NoMigrationsError) {
+      const raw = createHash('sha256')
+      raw.update('bundle-raw-v1\n')
+      raw.update(tarball)
+      return { hash: raw.digest('hex'), valid: false }
+    }
+    throw error
+  }
+}
+
+async function hashValidatedContents(entries: ValidatedEntry[], tarball: Buffer): Promise<string> {
+  const supabaseRoot = path.resolve(HASH_ROOT, 'supabase')
+  const byArchiveIndex = new Map<number, ValidatedEntry>()
+  for (const v of entries) byArchiveIndex.set(v.archiveIndex, v)
+
+  // Same pairing discipline as extractValidated: key by parser-emission
+  // position (not path) so duplicate paths are all seen, and let the last
+  // write win below, matching what extraction leaves on disk.
+  const collected: Array<{ v: ValidatedEntry | null; bodyPromise: Promise<Buffer> }> = []
+  await new Promise<void>((resolve, reject) => {
+    const parser = new Parser({ strict: true })
+    parser.on('entry', (entry: ReadEntry) => {
+      collected.push({ v: byArchiveIndex.get(collected.length) ?? null, bodyPromise: readEntryBody(entry) })
+    })
+    parser.on('end', () => resolve())
+    parser.on('error', (error: Error) => {
+      reject(new InvalidBundleError(`Failed to parse tarball during hashing: ${error.message}`))
+    })
+    parser.end(tarball)
+  })
+
+  const records = new Map<string, { kind: 'file' | 'symlink'; digest: string }>()
+  for (const c of collected) {
+    const body = await c.bodyPromise
+    const v = c.v
+    if (!v) continue
+    // Mode is set only for File and SymbolicLink entries; directories
+    // are mkdir'd implicitly and carry no content to hash.
+    if (v.mode === undefined) continue
+    const key = path.relative(supabaseRoot, v.destPath).split(path.sep).join('/')
+    const isSymlink = v.linkTarget !== undefined
+    const content = isSymlink ? Buffer.from(`symlink\u0000${v.linkTarget}`) : body
+    records.set(key, { kind: isSymlink ? 'symlink' : 'file', digest: createHash('sha256').update(content).digest('hex') })
+  }
+
+  const digest = createHash('sha256')
+  digest.update('bundle-contents-v2\n')
+  for (const key of [...records.keys()].sort()) {
+    const record = records.get(key)!
+    const keyBytes = Buffer.from(key, 'utf8')
+    // Length-prefixed, newline-free framing (review finding 8): no field
+    // value can forge a record boundary, so distinct (path, kind, content)
+    // sets can never serialize to the same preimage.
+    const length = Buffer.alloc(4)
+    length.writeUInt32BE(keyBytes.length)
+    digest.update(length)
+    digest.update(keyBytes)
+    digest.update(Buffer.from([record.kind === 'symlink' ? 0x01 : 0x00]))
+    digest.update(Buffer.from(record.digest, 'hex'))
+  }
+  return digest.digest('hex')
 }
 
 // Re-exported for tests: lets test fixtures create tarballs with arbitrary

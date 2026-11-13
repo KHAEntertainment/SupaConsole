@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
@@ -6,88 +7,15 @@ import * as path from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  bundleContentHash,
   ingestBundle,
   InvalidBundleError,
   normalizeMode,
   NoMigrationsError,
 } from '../src/lib/bundle-ingest'
+import { buildTarball, ustarHeader, type Entry } from './helpers/build-tar'
 
 const execFileAsync = promisify(execFile)
-
-// Build a ustar (POSIX) tarball from a list of entries. The tar CLI on
-// macOS (bsdtar) and Linux (GNU tar) both reject evil entries, so for the
-// hostile-fixture tests we hand-build the header bytes: ustar is small
-// enough to do without a dependency.
-//
-// `entries` items can include any of:
-//   { name: 'foo.txt', body: 'text' }                          // regular file
-//   { name: 'foo.txt', body: 'text', mode: 0o4755 }            // regular file with custom mode
-//   { name: 'dir/', type: 'dir' }                             // directory
-//   { name: 'link', type: 'symlink', linkname: 'x' }          // symbolic link
-//   { name: 'hard', type: 'hardlink', linkname: 'x' }         // hard link (typeflag '1')
-type Entry =
-  | { name: string; body: string; mode?: number }
-  | { name: string; type: 'dir' }
-  | { name: string; type: 'symlink'; linkname: string }
-  | { name: string; type: 'hardlink'; linkname: string }
-
-function pad(num: number, size: number): string {
-  return num.toString(8).padStart(size - 1, '0') + '\0'
-}
-
-// Build one 512-byte ustar header. Numeric fields are octal strings; the
-// checksum is a 6-digit octal followed by NUL + space per POSIX.
-function ustarHeader(input: {
-  name: string
-  mode?: number
-  size?: number
-  typeflag: string
-  linkname?: string
-}): Buffer {
-  const buf = Buffer.alloc(512)
-  buf.write(input.name, 0, 100, 'utf8')
-  buf.write(pad(input.mode ?? 0o644, 8), 100, 8)
-  buf.write('0000000', 108, 8)
-  buf.write('0000000', 116, 8)
-  buf.write(pad(input.size ?? 0, 12), 124, 12)
-  buf.write(pad(0, 12), 136, 12)
-  // Checksum placeholder (spaces during compute).
-  for (let i = 148; i < 156; i++) buf[i] = 0x20
-  buf.write(input.typeflag, 156, 1)
-  buf.write(input.linkname ?? '', 157, 100, 'utf8')
-  buf.write('ustar\0', 257, 6)
-  buf.write('00', 263, 2)
-  // Compute checksum over the entire header.
-  let sum = 0
-  for (let i = 0; i < 512; i++) sum += buf[i]
-  const cks = sum.toString(8).padStart(6, '0')
-  buf.write(cks + '\0 ', 148, 8)
-  return buf
-}
-
-// Assemble a tarball from raw entries, padding file bodies to 512-byte
-// boundaries and adding two end-of-archive blocks.
-function buildTarball(entries: Entry[]): Buffer {
-  const blocks: Buffer[] = []
-  for (const e of entries) {
-    if ('body' in e) {
-      const body = Buffer.from(e.body, 'utf8')
-      blocks.push(ustarHeader({ name: e.name, size: body.length, typeflag: '0', mode: e.mode }))
-      blocks.push(body)
-      const padLen = (512 - (body.length % 512)) % 512
-      if (padLen > 0) blocks.push(Buffer.alloc(padLen))
-    } else if (e.type === 'dir') {
-      blocks.push(ustarHeader({ name: e.name, typeflag: '5' }))
-    } else if (e.type === 'symlink') {
-      blocks.push(ustarHeader({ name: e.name, typeflag: '2', linkname: e.linkname }))
-    } else {
-      // hardlink (typeflag '1')
-      blocks.push(ustarHeader({ name: e.name, typeflag: '1', linkname: e.linkname }))
-    }
-  }
-  blocks.push(Buffer.alloc(1024)) // two zero blocks: end-of-archive
-  return Buffer.concat(blocks)
-}
 
 // Build a tarball from a real on-disk fixture directory using the system
 // tar CLI. Used for the happy-path test where the bundle is byte-for-byte
@@ -700,5 +628,101 @@ describe('ingestBundle: stale staging sweep (P3-6)', () => {
     expect(leftover.filter((n) => n.startsWith('.supabase-old-'))).toEqual([])
     expect(leftover.filter((n) => n.startsWith('.functions-old-'))).toEqual([])
     expect(leftover).toContain('supabase')
+  })
+})
+
+describe('bundleContentHash (T20 change detection)', () => {
+  const base = () => buildTarball([
+    { name: 'supabase/migrations/0001_a.sql', body: 'create table a;' },
+    { name: 'supabase/migrations/0002_b.sql', body: 'create table b;' },
+    { name: 'supabase/seed.sql', body: 'insert into a;' },
+  ])
+
+  it('hashes validated contents, not tarball bytes: a repack of the same files matches', async () => {
+    const repacked = buildTarball([
+      { name: './supabase/seed.sql', body: 'insert into a;', mode: 0o600 },
+      { name: 'supabase/migrations/0002_b.sql', body: 'create table b;', mode: 0o755 },
+      { name: 'supabase/migrations/0001_a.sql', body: 'create table a;' },
+    ])
+    // Different entry order, modes and name shape: raw bytes differ...
+    expect(repacked.equals(base())).toBe(false)
+    // ...but the extracted, validated contents are the same files.
+    expect((await bundleContentHash(repacked)).hash).toBe((await bundleContentHash(base())).hash)
+    expect((await bundleContentHash(base())).valid).toBe(true)
+  })
+
+  it('changes when a validated file changes', async () => {
+    const changed = buildTarball([
+      { name: 'supabase/migrations/0001_a.sql', body: 'create table a;' },
+      { name: 'supabase/migrations/0002_b.sql', body: 'create table b cascade;' },
+      { name: 'supabase/seed.sql', body: 'insert into a;' },
+    ])
+    expect((await bundleContentHash(changed)).hash).not.toBe((await bundleContentHash(base())).hash)
+  })
+
+  it('falls back to a deterministic raw hash for bundles with no validated contents', async () => {
+    const garbage = Buffer.from('not a tarball')
+    expect((await bundleContentHash(garbage)).hash).toBe((await bundleContentHash(Buffer.from('not a tarball'))).hash)
+    expect((await bundleContentHash(garbage)).hash).not.toBe((await bundleContentHash(Buffer.from('other garbage'))).hash)
+    // Both are invalid: the flag tells the update path not to rebuild for them.
+    expect((await bundleContentHash(garbage)).valid).toBe(false)
+    // Parses cleanly but has no migrations: still no validated contents.
+    const noMigrations = buildTarball([{ name: 'supabase/seed.sql', body: 'insert into a;' }])
+    expect((await bundleContentHash(noMigrations)).valid).toBe(false)
+    expect((await bundleContentHash(noMigrations)).hash).not.toBe((await bundleContentHash(garbage)).hash)
+    expect((await bundleContentHash(noMigrations)).hash).toBe(
+      (await bundleContentHash(buildTarball([{ name: 'supabase/seed.sql', body: 'insert into a;' }]))).hash,
+    )
+  })
+
+  it('rejects writes through an archive symlink parent in either order (T20 review 7)', async () => {
+    const prefix: Entry[] = [
+      { name: 'supabase/migrations/20260101000000_a.sql', body: 'select 1;' },
+      { name: 'supabase/functions/real/', type: 'dir' },
+      { name: 'supabase/functions/alias', type: 'symlink', linkname: 'real' },
+    ]
+    const real = { name: 'supabase/functions/real/index.ts', body: 'real code' }
+    const alias = { name: 'supabase/functions/alias/index.ts', body: 'alias code' }
+    const one = buildTarball([...prefix, real, alias])
+    const two = buildTarball([...prefix, alias, real])
+    // The write through the symlink parent lands on `real/` behind the
+    // hash's back; validation now refuses it outright, so extraction order
+    // can no longer change the produced code for one hash.
+    await expect(ingestBundle({ tarball: one, projectDir: projectDir('alias-one') })).rejects.toBeInstanceOf(InvalidBundleError)
+    await expect(ingestBundle({ tarball: two, projectDir: projectDir('alias-two') })).rejects.toBeInstanceOf(InvalidBundleError)
+    expect((await bundleContentHash(one)).valid).toBe(false)
+    expect((await bundleContentHash(one)).hash).not.toBe((await bundleContentHash(two)).hash)
+  })
+
+  it('rejects a directory marker colliding with a file at the same path (T20 review 7)', async () => {
+    const one = buildTarball([
+      { name: 'supabase/migrations/20260101000000_a.sql', body: 'select 1;' },
+      { name: 'supabase/functions/a', body: 'file body' },
+      { name: 'supabase/functions/a/', type: 'dir' },
+    ])
+    await expect(ingestBundle({ tarball: one, projectDir: projectDir('collide') })).rejects.toBeInstanceOf(InvalidBundleError)
+  })
+
+  it('frames hash records so newline paths cannot forge a collision (T20 review 8)', async () => {
+    const content = 'one'
+    const digest = createHash('sha256').update(content).digest('hex')
+    const migration = { name: 'supabase/migrations/20260101000000_a.sql', body: 'select 1;' }
+    const one = buildTarball([migration,
+      { name: 'supabase/functions/a', body: content },
+      { name: 'supabase/functions/z', body: 'two' }])
+    // The attack path is 102 bytes and must survive USTAR name+prefix
+    // encoding intact (R2-5), or the pair is not a real collision fixture.
+    const collisionName = `supabase/functions/a\nfile\n${digest}\nfunctions/z`
+    expect(collisionName.length).toBe(102)
+    const two = buildTarball([migration, { name: collisionName, body: 'two' }])
+    await ingestBundle({ tarball: two, projectDir: projectDir('newline-roundtrip') })
+    expect(await fs.readFile(path.join(projectDir('newline-roundtrip'), collisionName), 'utf8')).toBe('two')
+    // Unambiguous framing: the pair no longer shares a hash-record
+    // preimage. The old newline-joined hash collides on exactly this pair.
+    const hashOf = async (tarball: Buffer) => {
+      const result: unknown = await bundleContentHash(tarball)
+      return typeof result === 'string' ? result : (result as { hash: string }).hash
+    }
+    expect(await hashOf(one)).not.toBe(await hashOf(two))
   })
 })

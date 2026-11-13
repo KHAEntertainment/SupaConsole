@@ -295,4 +295,27 @@ describe('operation state machine', () => {
     await expect(transitionOperation(client, queued.id, 'provisioning'))
       .rejects.toBeInstanceOf(IllegalOperationTransitionError)
   })
+
+  it('scopes legacy project-status recovery to the recovered ids (T20 review R2-4)', async () => {
+    const target = await makeOperation('r2-recover', 'preview')
+    const otherOwner = await client.user.create({
+      data: { email: `t12-${randomBytes(4).toString('hex')}@example.test`, password: 'unused' },
+    })
+    const other = await client.project.create({
+      data: { name: 'r2-other', slug: `r2-other-${randomBytes(4).toString('hex')}`, ownerId: otherOwner.id,
+        environmentType: 'preview', status: 'active' },
+    })
+    await client.operation.create({ data: { projectId: other.id, kind: 'r2-recover', state: 'failed' } })
+    await client.operation.create({ data: { projectId: other.id, kind: 'r2-recover', state: 'ready' } })
+    // Empty scope: nothing moves.
+    expect(await recoverInterruptedOperations(client, { kind: 'r2-recover', ids: [] })).toBe(0)
+    expect((await client.project.findUniqueOrThrow({ where: { id: other.id } })).status).toBe('active')
+    // Narrowed scope: only the selected operation settles, and only its own
+    // project may follow it (82c1f86: the NULL-owner branch ignores ids and
+    // flips the unrelated project to failed).
+    expect(await recoverInterruptedOperations(client, { kind: 'r2-recover', ids: [target.id] })).toBe(1)
+    expect((await client.operation.findUniqueOrThrow({ where: { id: target.id } }))).toMatchObject({ state: 'failed' })
+    expect((await client.project.findUniqueOrThrow({ where: { id: other.id } })).status).toBe('active')
+    expect((await client.project.findUniqueOrThrow({ where: { id: target.projectId } })).status).toBe('failed')
+  })
 })
